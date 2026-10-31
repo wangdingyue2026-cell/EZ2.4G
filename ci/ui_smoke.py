@@ -69,6 +69,22 @@ def grab(win, name, pad=24):
                    all_screens=True).save(os.path.join(out, name + ".png"))
 
 
+def record(root, bbox, name, seconds):
+    """连续截屏存成 GIF，用来检查动效。"""
+    frames, stamps = [], []
+    end = time.time() + seconds
+    while time.time() < end:
+        root.update()
+        frames.append(ImageGrab.grab(bbox=bbox, all_screens=True)
+                      .convert("P", palette=1, colors=255))
+        stamps.append(time.time())
+    if len(frames) > 1:
+        gaps = [max(20, int((b - a) * 1000))
+                for a, b in zip(stamps, stamps[1:])] + [800]
+        frames[0].save(os.path.join(out, name + ".gif"), save_all=True,
+                       append_images=frames[1:], duration=gaps, loop=0)
+
+
 def report(exc, val, tb):
     import traceback
     errors.append("".join(traceback.format_exception(exc, val, tb)))
@@ -82,8 +98,12 @@ for light in (False, True):
         app.panel = p
         p.root.report_callback_exception = report
         p._check_dismiss = lambda: None  # 无人值守，别让失焦把面板收起
-        p.show()
-        pump(p.root, 0.8)
+        p.show()  # show() 同步算好最终位置，动画随后才跑
+        x, y = p._anchor()
+        box = (x - 40, y - 40, x + p.W + 40, y + p.H + 40)
+        if label == "devices" and not light:
+            record(p.root, box, "anim_open_dark", 1.4)
+        pump(p.root, 1.5)
         grab(p.root, f"panel_{label}_{tag}")
         if label == "devices":
             ev = types.SimpleNamespace(
@@ -95,19 +115,30 @@ for light in (False, True):
             if p._menu:
                 grab(p._menu.root, f"menu_{tag}")
                 p._close_menu()
-            p._edit_name("a", 62 * p.S, 50 * p.S)
+            p._edit_name_at("a")
             pump(p.root, 0.2)
             grab(p.root, f"rename_{tag}")
             p._commit_name(False)
+            if not light:
+                p._hover_card("a", True)
+                p._toggle_startup()
+                record(p.root, box, "anim_hover_toggle_dark", 0.7)
+                p._hover_card("a", False)
+                pump(p.root, 0.3)
             p.open_help("d")
-            pump(p.root, 0.4)
+            pump(p.root, 0.9)
             grab(p._help_win.root, f"help_{tag}")
             p._close_help()
             app._add_win = md.AddDeviceWindow(app, 0x373B, 0x1278,
                                               "ATK mini A9 pro", 85)
-            pump(p.root, 0.4)
+            pump(p.root, 1.2)
             grab(app._add_win.root, f"add_{tag}")
             app._add_win._done(False)
+        if label == "devices" and light:
+            p.show()
+            pump(p.root, 1.5)
+            p.hide()
+            record(p.root, box, "anim_close_light", 0.4)
         p.close()
 
 # 真实入口：托盘模式与 --panel 模式各跑几秒，stderr 里不能有 Traceback
