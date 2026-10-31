@@ -1,0 +1,44 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: [main, fluent-ui]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip pyinstaller==6.11.1 pillow
+
+      - name: UI smoke test (render every window and screenshot it)
+        run: python ci/ui_smoke.py my_devices.py screenshots
+
+      - name: Build exe
+        run: pyinstaller --noconfirm --onefile --windowed --name 2.4G --icon app.ico my_devices.py
+
+      - name: Check the exe starts
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\2.4G.exe -ArgumentList '--list' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "2.4G.exe --list exited with $($p.ExitCode)" }
+          Get-Item dist\2.4G.exe | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 2.4G-exe
+          path: dist/2.4G.exe
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-screenshots
+          path: screenshots/

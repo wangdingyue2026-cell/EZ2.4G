@@ -2572,95 +2572,312 @@ def main(argv):
 
 
 # ===========================================================================
-# 配色
+# Fluent 界面：配色、字体与抗锯齿绘制
 # ===========================================================================
-def theme_colors(light: bool) -> dict:
-    if light:
-        return {
-            "bg1": (238, 243, 249), "bg2": (219, 229, 241),
-            "card": (251, 253, 255), "card2": (243, 248, 255),
-            "line": (208, 220, 235), "text": (18, 27, 38),
-            "sub": (91, 107, 124), "dim": (140, 155, 170),
-            "accent": (22, 119, 255), "green": (22, 163, 74),
-            "yellow": (217, 119, 6), "red": (220, 38, 38),
-            "track": (226, 235, 245), "hover": (232, 241, 252),
-            "glass": (255, 255, 255),
-        }
-    return {
-        "bg1": (13, 18, 25), "bg2": (27, 36, 48),
-        "card": (31, 41, 54), "card2": (38, 50, 65),
-        "line": (55, 70, 88), "text": (232, 240, 250),
-        "sub": (150, 165, 182), "dim": (110, 126, 144),
-        "accent": (80, 160, 255), "green": (52, 211, 120),
-        "yellow": (250, 190, 60), "red": (248, 113, 113),
-        "track": (48, 62, 79), "hover": (44, 58, 75),
-        "glass": (255, 255, 255),
-    }
+import base64
+import zlib
+import tkinter as tk
+import tkinter.font as tkfont
+import webbrowser
+from tkinter import filedialog, messagebox, simpledialog
+
+FONT = "Microsoft YaHei UI"
+
+try:
+    IS_WIN11 = sys.getwindowsversion().build >= 22000
+except Exception:
+    IS_WIN11 = False
+
+# Segoe Fluent Icons / Segoe MDL2 Assets 的码位（两套字体一致）
+GLYPH = {
+    "refresh": "", "close": "", "mouse": "",
+    "headset": "", "keyboard": "", "gamepad": "",
+    "device": "", "rename": "", "delete": "",
+    "settings": "", "info": "", "link": "",
+    "folder": "",
+}
+
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+user32.GetSystemMetrics.restype = ctypes.c_int
+user32.SystemParametersInfoW.argtypes = [wt.UINT, wt.UINT, ctypes.c_void_p,
+                                         wt.UINT]
+user32.SystemParametersInfoW.restype = wt.BOOL
 
 
-def level_color(level: Optional[int], light: bool) -> tuple:
-    c = theme_colors(light)
-    if level is None:
-        return c["dim"]
-    if level >= 60:
-        return c["green"]
-    if level >= 30:
-        return c["yellow"]
-    return c["red"]
+def _mix(a, b, t):
+    return (int(a[0] + (b[0] - a[0]) * t),
+            int(a[1] + (b[1] - a[1]) * t),
+            int(a[2] + (b[2] - a[2]) * t))
 
 
 def _rgb(c):
     return "#%02x%02x%02x" % c
 
 
-def round_rect_points(x1, y1, x2, y2, r, steps=10):
-    pts = []
-    for cx, cy, a0 in ((x2 - r, y1 + r, -90), (x2 - r, y2 - r, 0),
-                       (x1 + r, y2 - r, 90), (x1 + r, y1 + r, 180)):
-        for i in range(steps + 1):
-            a = (a0 + 90 * i / steps) * 3.141592653589793 / 180
-            pts.append((cx + r * __import__("math").cos(a),
-                        cy + r * __import__("math").sin(a)))
-    return pts
+def accent_rgb() -> tuple:
+    """系统强调色（DWM AccentColor 是 0xAABBGGRR），读不到就用 Windows 默认蓝。"""
+    v = reg_dword(r"Software\Microsoft\Windows\DWM", "AccentColor", 0)
+    if not v:
+        return (0, 120, 212)
+    return (v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF)
 
 
-def draw_round_rect(cv: "tk.Canvas", x1, y1, x2, y2, r, **kw):
-    pts = round_rect_points(x1, y1, x2, y2, r)
-    flat = [v for p in pts for v in p]
-    return cv.create_polygon(flat, smooth=False, **kw)
+def fluent_colors(light: bool) -> dict:
+    acc = accent_rgb()
+    if light:
+        accent = _mix(acc, (0, 0, 0), 0.08)
+        return {
+            "bg": (243, 243, 243), "footer": (235, 235, 235),
+            "divider": (224, 224, 224),
+            "card": (251, 251, 251), "card_hover": (246, 246, 246),
+            "stroke": (229, 229, 229), "well": (237, 237, 237),
+            "text": (26, 26, 26), "sub": (96, 96, 96), "dim": (138, 138, 138),
+            "accent": accent, "accent_hover": _mix(accent, (255, 255, 255), 0.1),
+            "on_accent": (255, 255, 255), "link": _mix(acc, (0, 0, 0), 0.2),
+            "ok": (15, 123, 15), "warn": (157, 93, 0), "bad": (196, 43, 28),
+            "track": (222, 222, 222),
+            "ctl": (251, 251, 251), "ctl_hover": (246, 246, 246),
+            "ctl_stroke": (214, 214, 214), "ctl_off": (245, 245, 245),
+            "subtle_hover": (229, 229, 229),
+            "menu": (249, 249, 249), "menu_hover": (234, 234, 234),
+            "info": (236, 240, 246),
+        }
+    accent = _mix(acc, (255, 255, 255), 0.45)
+    return {
+        "bg": (44, 44, 44), "footer": (36, 36, 36), "divider": (28, 28, 28),
+        "card": (54, 54, 54), "card_hover": (61, 61, 61),
+        "stroke": (34, 34, 34), "well": (68, 68, 68),
+        "text": (255, 255, 255), "sub": (208, 208, 208), "dim": (150, 150, 150),
+        "accent": accent, "accent_hover": _mix(accent, (0, 0, 0), 0.1),
+        "on_accent": (0, 0, 0), "link": accent,
+        "ok": (108, 203, 95), "warn": (252, 225, 0), "bad": (255, 153, 164),
+        "track": (78, 78, 78),
+        "ctl": (60, 60, 60), "ctl_hover": (68, 68, 68),
+        "ctl_stroke": (74, 74, 74), "ctl_off": (52, 52, 52),
+        "subtle_hover": (60, 60, 60),
+        "menu": (44, 44, 44), "menu_hover": (61, 61, 61),
+        "info": (52, 56, 62),
+    }
 
 
-# ===========================================================================
-# 窗口玻璃 / 圆
-# ===========================================================================
-class ACCENTPOLICY(ctypes.Structure):
-    _fields_ = [("AccentState", ctypes.c_int), ("AccentFlags", ctypes.c_int),
-                ("GradientColor", wt.DWORD), ("AnimationId", ctypes.c_int)]
+def level_rgb(level: Optional[int], c: dict) -> tuple:
+    if level is None:
+        return c["dim"]
+    if level >= 60:
+        return c["ok"]
+    if level >= 30:
+        return c["warn"]
+    return c["bad"]
 
 
-class WINDOWCOMPOSITIONATTRIBDATA(ctypes.Structure):
-    _fields_ = [("Attribute", ctypes.c_int), ("Data", ctypes.c_void_p),
-                ("SizeOfData", ctypes.c_size_t)]
+def _device_glyph(name: str) -> str:
+    n = (name or "").lower()
+    for words, key in ((("mouse", "鼠标", "mice"), "mouse"),
+                       (("headset", "耳机", "buds", "headphone", "audio"),
+                        "headset"),
+                       (("keyboard", "键盘"), "keyboard"),
+                       (("gamepad", "controller", "手柄"), "gamepad")):
+        if any(w in n for w in words):
+            return GLYPH[key]
+    return GLYPH["device"]
 
 
-def apply_acrylic(hwnd: int, light: bool) -> bool:
-    try:
-        user32.SetWindowCompositionAttribute.argtypes = [
-            wt.HWND, ctypes.POINTER(WINDOWCOMPOSITIONATTRIBDATA)]
-        policy = ACCENTPOLICY()
-        policy.AccentState = 4  # ACCENT_ENABLE_ACRYLICBLURBEHIND
-        policy.AccentFlags = 2
-        # AABBGGRR
-        policy.GradientColor = 0xE6F2F2F2 if light else 0xE61A1A1A
-        data = WINDOWCOMPOSITIONATTRIBDATA()
-        data.Attribute = 19  # WCA_ACCENT_POLICY
-        data.Data = ctypes.cast(ctypes.byref(policy), ctypes.c_void_p)
-        data.SizeOfData = ctypes.sizeof(policy)
-        return bool(user32.SetWindowCompositionAttribute(hwnd, ctypes.byref(data)))
-    except Exception:
-        return False
+_ICON_FONT = None
+_NUM_FONT = None
 
 
+def icon_font(root) -> str:
+    global _ICON_FONT
+    if _ICON_FONT is None:
+        fams = set(tkfont.families(root))
+        _ICON_FONT = ("Segoe Fluent Icons" if "Segoe Fluent Icons" in fams
+                      else "Segoe MDL2 Assets")
+    return _ICON_FONT
+
+
+def num_font(root) -> str:
+    global _NUM_FONT
+    if _NUM_FONT is None:
+        fams = set(tkfont.families(root))
+        _NUM_FONT = next((f for f in ("Segoe UI Variable Display",
+                                      "Segoe UI Variable Text", "Segoe UI")
+                          if f in fams), FONT)
+    return _NUM_FONT
+
+
+# -- 纯 Python 抗锯齿光栅：生成 RGBA PNG 给 Tk 的 PhotoImage ---------------
+def _png_b64(w: int, h: int, px: bytearray) -> str:
+    stride = w * 4
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)
+        raw += px[y * stride:(y + 1) * stride]
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+           + chunk(b"IEND", b""))
+    return base64.b64encode(png).decode("ascii")
+
+
+def _cov(d: float) -> float:
+    """有符号距离（负数在内）→ 像素覆盖率。"""
+    if d >= 0.5:
+        return 0.0
+    if d <= -0.5:
+        return 1.0
+    return 0.5 - d
+
+
+def _sd_rrect(x, y, cx, cy, hx, hy, r):
+    qx = abs(x - cx) - (hx - r)
+    qy = abs(y - cy) - (hy - r)
+    return (math.hypot(qx if qx > 0 else 0.0, qy if qy > 0 else 0.0)
+            + min(max(qx, qy), 0.0) - r)
+
+
+def rrect_png(w: int, h: int, r: float, fill, stroke=None,
+              sw: float = 1.0) -> str:
+    """圆角矩形：fill 为 None 时只画描边；内部像素直接走快路径。"""
+    px = bytearray(w * h * 4)
+    r = max(0.5, min(r, w / 2.0, h / 2.0))
+    cx, cy, hx, hy = w / 2.0, h / 2.0, w / 2.0, h / 2.0
+    edge = r + sw + 1.5
+    fill_px = bytes((fill[0], fill[1], fill[2], 255)) if fill else None
+    for y in range(h):
+        fy = y + 0.5
+        near_y = fy < edge or fy > h - edge
+        band_y = fy < sw + 1.5 or fy > h - sw - 1.5
+        row = y * w * 4
+        for x in range(w):
+            fx = x + 0.5
+            if not band_y and (sw + 1.5 < fx < w - sw - 1.5) and (
+                    not near_y or edge < fx < w - edge):
+                if fill_px is not None:
+                    px[row + x * 4:row + x * 4 + 4] = fill_px
+                continue
+            d = _sd_rrect(fx, fy, cx, cy, hx, hy, r)
+            a = _cov(d)
+            if a <= 0.0:
+                continue
+            if stroke is None:
+                col, alpha = fill, a
+            else:
+                t = _cov(d + sw)
+                if fill is None:
+                    col, alpha = stroke, a - t
+                else:
+                    k = t / a
+                    col = _mix(stroke, fill, k)
+                    alpha = a
+            if alpha <= 0.0:
+                continue
+            i = row + x * 4
+            px[i] = col[0]
+            px[i + 1] = col[1]
+            px[i + 2] = col[2]
+            px[i + 3] = int(alpha * 255 + 0.5)
+    return _png_b64(w, h, px)
+
+
+def _composite(w: int, h: int, layers) -> str:
+    """layers = [(sdf(x, y), rgb)]，自下而上做 over 合成。"""
+    px = bytearray(w * h * 4)
+    for y in range(h):
+        fy = y + 0.5
+        for x in range(w):
+            fx = x + 0.5
+            r = g = b = a = 0.0
+            for sd, col in layers:
+                k = _cov(sd(fx, fy))
+                if k <= 0.0:
+                    continue
+                r = col[0] * k + r * (1 - k)
+                g = col[1] * k + g * (1 - k)
+                b = col[2] * k + b * (1 - k)
+                a = k + a * (1 - k)
+            if a <= 0.0:
+                continue
+            i = (y * w + x) * 4
+            px[i] = min(255, int(r / a + 0.5))
+            px[i + 1] = min(255, int(g / a + 0.5))
+            px[i + 2] = min(255, int(b / a + 0.5))
+            px[i + 3] = int(a * 255 + 0.5)
+    return _png_b64(w, h, px)
+
+
+def disc_png(size: int, color) -> str:
+    c = size / 2.0
+    return _composite(size, size,
+                      [(lambda x, y: math.hypot(x - c, y - c) - c, color)])
+
+
+def ring_png(size: int, thick: float, level: Optional[int], color,
+             track) -> str:
+    """电量圆环：12 点钟起顺时针，圆头端点。"""
+    px = bytearray(size * size * 4)
+    c = size / 2.0
+    rm = (size - thick) / 2.0
+    hw = thick / 2.0
+    lv = 0 if level is None else max(0, min(100, int(level)))
+    sweep = 2 * math.pi * lv / 100.0
+    sx, sy = c, c - rm
+    ex, ey = c + rm * math.sin(sweep), c - rm * math.cos(sweep)
+    for y in range(size):
+        fy = y + 0.5
+        for x in range(size):
+            fx = x + 0.5
+            dx, dy = fx - c, fy - c
+            dist = math.hypot(dx, dy)
+            tc = _cov(abs(dist - rm) - hw)
+            if tc <= 0.0:
+                continue
+            if lv >= 100:
+                pc = tc
+            elif lv <= 0:
+                pc = 0.0
+            else:
+                ang = math.atan2(dx, -dy) % (2 * math.pi)
+                if ang <= sweep:
+                    pc = tc
+                else:
+                    pc = max(_cov(math.hypot(fx - sx, fy - sy) - hw),
+                             _cov(math.hypot(fx - ex, fy - ey) - hw))
+            a = pc + tc * (1 - pc)
+            i = (y * size + x) * 4
+            for j in range(3):
+                px[i + j] = min(255, int((color[j] * pc
+                                          + track[j] * tc * (1 - pc)) / a
+                                         + 0.5))
+            px[i + 3] = int(a * 255 + 0.5)
+    return _png_b64(size, size, px)
+
+
+def toggle_png(w: int, h: int, s: float, on: bool, hover: bool,
+               c: dict) -> str:
+    hx, hy, r = w / 2.0, h / 2.0, h / 2.0
+    knob = (7.0 if hover else 6.0) * s
+    if on:
+        fill = c["accent_hover"] if hover else c["accent"]
+        kx = w - r
+        layers = [(lambda x, y: _sd_rrect(x, y, hx, hy, hx, hy, r), fill),
+                  (lambda x, y: math.hypot(x - kx, y - hy) - knob,
+                   c["on_accent"])]
+    else:
+        kx = r
+        inset = max(1.0, s)
+        layers = [(lambda x, y: _sd_rrect(x, y, hx, hy, hx, hy, r), c["sub"]),
+                  (lambda x, y: _sd_rrect(x, y, hx, hy, hx - inset,
+                                          hy - inset, r - inset),
+                   c["ctl_hover"] if hover else c["ctl_off"]),
+                  (lambda x, y: math.hypot(x - kx, y - hy) - knob, c["sub"])]
+    return _composite(w, h, layers)
+
+
+# -- 窗口外观 -----------------------------------------------------------------
 def set_round_region(hwnd: int, w: int, h: int, radius: int = 24) -> None:
     try:
         rgn = gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius)
@@ -2669,14 +2886,44 @@ def set_round_region(hwnd: int, w: int, h: int, radius: int = 24) -> None:
         pass
 
 
-# ===========================================================================
-# 简洁面板?# ===========================================================================
-import tkinter as tk
-import tkinter.font as tkfont
-import webbrowser
-from tkinter import filedialog, messagebox, simpledialog
+def toplevel_hwnd(win) -> int:
+    child = win.winfo_id()
+    try:
+        return user32.GetAncestor(child, 2) or child
+    except Exception:
+        return child
 
-FONT = "Microsoft YaHei UI"
+
+def apply_fluent_frame(win, w: int, h: int, radius: int, border) -> None:
+    """Win11：DWM 原生圆角 + 描边 + 阴影；Win10：窗口区域裁圆角。"""
+    hwnd = toplevel_hwnd(win)
+    if IS_WIN11:
+        try:
+            pref = ctypes.c_int(2)  # DWMWCP_ROUND
+            dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(pref), 4)
+            col = wt.DWORD(COLORREF(*border))
+            dwmapi.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(col), 4)
+            GCL_STYLE = -26
+            style = user32.GetClassLongPtrW(hwnd, GCL_STYLE)
+            if not style & 0x00020000:  # CS_DROPSHADOW
+                user32.SetClassLongPtrW(hwnd, GCL_STYLE, style | 0x00020000)
+            return
+        except Exception:
+            pass
+    set_round_region(hwnd, w, h, radius * 2)
+
+
+def work_area() -> tuple:
+    sw = user32.GetSystemMetrics(0)
+    sh = user32.GetSystemMetrics(1)
+    rc = wt.RECT()
+    try:
+        if user32.SystemParametersInfoW(0x30, 0, ctypes.byref(rc), 0):
+            if rc.right > rc.left and rc.bottom > rc.top:
+                return rc.left, rc.top, rc.right, rc.bottom, sw, sh
+    except Exception:
+        pass
+    return 0, 0, sw, sh, sw, sh
 
 
 class BLENDFUNCTION(ctypes.Structure):
@@ -2829,10 +3076,197 @@ class _SHELLEXECUTEINFOW(ctypes.Structure):
     ]
 
 
-class HelpWindow:
-    """与主面板同的使用明窗口?"""
 
-    LW, LH = 520, 520
+class _Fluent:
+    """Fluent 窗口的公共部分：配色、字体、图像缓存、按钮与拖动。"""
+
+    def _fl_init(self, light: bool):
+        self.S = max(1.0, UI_SCALE)
+        self.light = light
+        self.c = fluent_colors(light)
+        self._imgs = {}
+        self._btns = {}
+        self._drag = None
+
+    def _set_theme(self, light: bool):
+        if light != self.light:
+            self.light = light
+            self.c = fluent_colors(light)
+            self._imgs.clear()
+
+    def _px(self, v) -> int:
+        return max(1, int(round(v * self.S)))
+
+    def _f(self, size, bold=False, family=None):
+        return (family or FONT, -int(round(size * self.S)),
+                "bold" if bold else "normal")
+
+    def _fi(self, size):
+        return (icon_font(self.root), -int(round(size * self.S)))
+
+    def _fn(self, size, bold=True):
+        return self._f(size, bold, num_font(self.root))
+
+    def _image(self, key, make):
+        img = self._imgs.get(key)
+        if img is None:
+            img = tk.PhotoImage(master=self.root, data=make(), format="png")
+            self._imgs[key] = img
+        return img
+
+    def _rr(self, w, h, r, fill, stroke=None):
+        W, H, R = self._px(w), self._px(h), r * self.S
+        sw = max(1.0, self.S)
+        return self._image(("rr", W, H, R, fill, stroke),
+                           lambda: rrect_png(W, H, R, fill, stroke, sw))
+
+    def _disc(self, size, color):
+        D = self._px(size)
+        return self._image(("disc", D, color), lambda: disc_png(D, color))
+
+    def _ring(self, size, thick, level, color):
+        D, T = self._px(size), thick * self.S
+        track = self.c["track"]
+        return self._image(("ring", D, T, level, color, track),
+                           lambda: ring_png(D, T, level, color, track))
+
+    def _fit(self, text, font, max_w) -> str:
+        """按逻辑像素宽度截断，超出加省略号。"""
+        f = tkfont.Font(root=self.root, font=font)
+        limit = max_w * self.S
+        if f.measure(text) <= limit:
+            return text
+        while text and f.measure(text + "…") > limit:
+            text = text[:-1]
+        return text + "…"
+
+    def _ctext(self, x, y, text, fill, font, tags=(), anchor="center",
+               **kw):
+        """按文字实际包围盒做垂直光学居中。"""
+        item = self.cv.create_text(x, y, text=text, fill=_rgb(fill),
+                                   font=font, tags=tags, anchor=anchor, **kw)
+        try:
+            _x1, y1, _x2, y2 = self.cv.bbox(item)
+            dy = (y1 + y2) / 2.0 - y
+            if abs(dy) >= 0.5:
+                self.cv.move(item, 0, -dy)
+        except Exception:
+            pass
+        return item
+
+    def _button(self, x, y, w, h, text, cmd, kind="standard", bg=None,
+                enabled=True, tag=None, glyph=False, size=None):
+        """kind：accent / standard / subtle / close。"""
+        c = self.c
+        cv = self.cv
+        tag = tag or f"btn_{text}_{int(x)}_{int(y)}"
+        bg = bg or c["bg"]
+        radius = 0 if kind == "close" else 4
+        if not enabled:
+            normal = self._rr(w, h, radius, c["ctl_off"], c["ctl_stroke"])
+            hover, col, hcol = normal, c["dim"], c["dim"]
+        elif kind == "accent":
+            normal = self._rr(w, h, radius, c["accent"])
+            hover = self._rr(w, h, radius, c["accent_hover"])
+            col = hcol = c["on_accent"]
+        elif kind == "subtle":
+            normal = None
+            hover = self._rr(w, h, radius, c["subtle_hover"])
+            col, hcol = c["sub"], c["text"]
+        elif kind == "close":
+            normal = None
+            hover = self._rr(w, h, 0.5, (196, 43, 28))
+            col, hcol = c["sub"], (255, 255, 255)
+        else:
+            normal = self._rr(w, h, radius, c["ctl"], c["ctl_stroke"])
+            hover = self._rr(w, h, radius, c["ctl_hover"], c["ctl_stroke"])
+            col = hcol = c["text"]
+        # 命中区：背景同色矩形，保证透明按钮的空白处也能点
+        cv.create_rectangle(x, y, x + w, y + h, fill=_rgb(bg), outline="",
+                            tags=(tag,))
+        img_n = (cv.create_image(x, y, image=normal, anchor="nw", tags=(tag,))
+                 if normal else None)
+        img_h = cv.create_image(x, y, image=hover, anchor="nw", tags=(tag,),
+                                state="hidden")
+        font = (self._fi(size or 12) if glyph
+                else self._f(size or 10, kind == "accent"))
+        txt = self._ctext(x + w / 2, y + h / 2, text, col, font, tags=(tag,))
+        self._btns[tag] = (img_n, img_h, txt, col, hcol)
+        if enabled:
+            cv.tag_bind(tag, "<Button-1>", lambda e: cmd())
+            cv.tag_bind(tag, "<Enter>", lambda e: self._hover_btn(tag, True))
+            cv.tag_bind(tag, "<Leave>", lambda e: self._hover_btn(tag, False))
+        return tag
+
+    def _hover_btn(self, tag, on):
+        info = self._btns.get(tag)
+        if not info:
+            return
+        img_n, img_h, txt, col, hcol = info
+        try:
+            if img_n:
+                self.cv.itemconfigure(img_n, state="hidden" if on else "normal")
+            self.cv.itemconfigure(img_h, state="normal" if on else "hidden")
+            self.cv.itemconfigure(txt, fill=_rgb(hcol if on else col))
+        except tk.TclError:
+            pass
+
+    def _link(self, x, y, text, cmd, tag, size=10, anchor="w"):
+        c = self.c
+        item = self._ctext(x, y, text, c["link"], self._f(size), tags=(tag,),
+                           anchor=anchor)
+        self.cv.tag_bind(tag, "<Button-1>", lambda e: cmd())
+        self.cv.tag_bind(tag, "<Enter>", lambda e: (
+            self.cv.configure(cursor="hand2"),
+            self.cv.itemconfigure(item, font=self._f(size) + ("underline",))))
+        self.cv.tag_bind(tag, "<Leave>", lambda e: (
+            self.cv.configure(cursor=""),
+            self.cv.itemconfigure(item, font=self._f(size))))
+        return item
+
+    def _center_on_work_area(self):
+        l, t, r, b, _sw, _sh = work_area()
+        x = l + max(0, (r - l - self.W) // 2)
+        y = t + max(0, (b - t - self.H) // 2)
+        self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
+
+    def _drag_press(self, e, head_h, skip=()):
+        self._drag = None
+        if e.y >= head_h * self.S:
+            return
+        tags = self.cv.gettags("current")
+        if any(t.startswith(skip) for t in tags):
+            return
+        self._drag = (e.x_root, e.y_root,
+                      self.root.winfo_x(), self.root.winfo_y())
+
+    def _drag_move(self, e):
+        if not self._drag:
+            return
+        x0, y0, wx, wy = self._drag
+        nx, ny = wx + e.x_root - x0, wy + e.y_root - y0
+        self.root.geometry(f"+{nx}+{ny}")
+        sh = getattr(self, "shadow", None)
+        if sh:
+            try:
+                sh.move(nx, ny)
+            except Exception:
+                pass
+
+
+class HelpWindow(_Fluent):
+    """读取设置：说明 + 抓包学习协议。"""
+
+    LW, LH = 480, 572
+    STEPS = [
+        "安装 USBPcap（装完重启电脑）。",
+        "关闭厂家驱动，点「开始抓包」并允许管理员权限。",
+        "打开厂家驱动，让它显示一次电量。",
+        "点「停止」，填入刚才看到的电量。",
+        "只有一个字节符合，就直接保存这个字节作为电量。",
+        "多个字节符合时，换一个电量再抓一次，对比差值。",
+        "保存后，以后插上就能直接读电量。",
+    ]
 
     def __init__(self, parent, key=None):
         self.parent = parent
@@ -2841,36 +3275,39 @@ class HelpWindow:
         self.dev_name = (r.name if r and r.name else "")
         self.target_vid = r.vid if r else 0
         self.target_pid = r.pid if r else 0
-        self.S = parent.S
-        self.W = int(self.LW * self.S)
-        self.H = int(self.LH * self.S)
         self.root = tk.Toplevel(parent.root)
+        self.root.title("读取设置")
         self.root.overrideredirect(True)
-        self.root.configure(bg="#0B1322")
+        self._fl_init(parent.app.theme_light)
+        self.W = self._px(self.LW)
+        self.H = self._px(self.LH)
+        self.root.configure(bg=_rgb(self.c["bg"]))
         try:
             self.root.attributes("-topmost", True)
+            self.root.attributes("-alpha", 0.0)
         except Exception:
             pass
         self.cv = tk.Canvas(self.root, width=self.W, height=self.H,
-                            highlightthickness=0, bd=0, bg="#0B1322")
+                            highlightthickness=0, bd=0,
+                            bg=_rgb(self.c["bg"]))
         self.cv.pack(fill="both", expand=True)
-        self.cv.bind("<Button-1>", self._on_press)
-        self.cv.bind("<B1-Motion>", self._on_drag)
-        self.cv.bind("<ButtonRelease-1>", self._on_release)
+        self.cv.bind("<Button-1>", lambda e: self._drag_press(
+            e, 64, ("help_", "btn_", "lnk_")))
+        self.cv.bind("<B1-Motion>", self._drag_move)
+        self.cv.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag",
+                                                            None))
+        self.root.bind("<Escape>", lambda e: self.close())
+        self._center_on_work_area()
         self.root.update_idletasks()
         self.hwnd = self.root.winfo_id()
-        set_round_region(self.hwnd, self.W, self.H, int(32 * self.S))
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        x = max(0, (sw - self.W) // 2)
-        y = max(0, (sh - self.H) // 2 - 20)
-        self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
+        apply_fluent_frame(self.root, self.W, self.H, self._px(8),
+                           self.c["stroke"])
         self.shadow = None
-        try:
-            self.shadow = ShadowWindow(self)
-        except Exception:
-            self.shadow = None
-        self._drag = None
+        if not IS_WIN11:
+            try:
+                self.shadow = ShadowWindow(self)
+            except Exception:
+                self.shadow = None
         self._capturing = False
         self._cap_file = None
         self._cap_proc = None
@@ -2884,150 +3321,86 @@ class HelpWindow:
         self._purge_capture_files()
         self.render()
         try:
+            self.root.attributes("-alpha", 1.0)
             self.root.update_idletasks()
             if self.shadow:
                 self.shadow.show(self.root.winfo_x(), self.root.winfo_y())
+            self.root.focus_force()
         except Exception:
             pass
-
-    def _f(self, size, bold=False):
-        return (FONT, -int(round(size * self.S)),
-                "bold" if bold else "normal")
 
     def render(self):
+        c = self.c
         cv = self.cv
         cv.delete("all")
+        self._btns = {}
         W, H = self.LW, self.LH
-        cv.create_rectangle(0, 0, W, H, fill=_rgb((27, 27, 28)), outline="")
-        cv.create_text(28, 34, text="使用说明", anchor="w",
-                       fill=_rgb((245, 245, 247)), font=self._f(16, True))
-        sub = "协议未知 · 如何让软件读到这款设备"
+        cv.create_rectangle(0, 0, W, H, fill=_rgb(c["bg"]), outline="")
+        if not IS_WIN11:
+            cv.create_image(0, 0, image=self._rr(W, H, 8, None, c["ctl_stroke"]),
+                            anchor="nw")
+        self._ctext(24, 30, "读取设置", c["text"], self._f(15, True),
+                    anchor="w")
+        sub = "协议未知 · 让软件学会读取这款设备的电量"
         if self.dev_name:
-            sub = f"{self.dev_name} · 如何让软件读到这款设备"
-        cv.create_text(28, 56, text=sub[:44], anchor="w",
-                       fill=_rgb((160, 163, 168)),
-                       font=self._f(9))
-        # 关闭按钮（圆形，悬停变红）
-        cv.create_oval(W - 44, 16, W - 16, 44, fill=_rgb((27, 27, 28)),
-                       outline=_rgb((27, 27, 28)), tags=("help_close",))
-        cv.create_text(W - 30, 30, text="✕", fill=_rgb((160, 163, 168)),
-                       font=self._f(11), tags=("help_close",))
-        cv.tag_bind("help_close", "<Button-1>", lambda e: self.close())
-        cv.tag_bind("help_close", "<Enter>", self._close_hover)
-        cv.tag_bind("help_close", "<Leave>", self._close_leave)
+            sub = f"{self.dev_name} · 协议未知"
+        self._ctext(24, 54, self._fit(sub, self._f(10), W - 90), c["sub"],
+                    self._f(10), anchor="w")
+        self._button(W - 46, 0, 46, 32, GLYPH["close"], self.close,
+                     kind="close", tag="help_close", glyph=True, size=10)
 
-        lines = [
-            ("h", "为什么读不到"),
-            ("b", "接收器在，但厂商协议未收录；软件只做只读试探。"),
-            ("h", "你可以这样做"),
-            ("b", "1. 安装 USBPcap（装完重启电脑）。"),
-            ("b", "2. 关闭厂家驱动，点「开始抓包」并允许管理员权限。"),
-            ("b", "3. 打开厂家驱动，让它显示一次电量。"),
-            ("b", "4. 点「停止」，填入刚才看到的电量。"),
-            ("b", "5. 只有一个字节符合，就直接保存这个字节作为电量。"),
-            ("b", "6. 多个字节符合时，换一个电量再抓一次，对比差值。"),
-            ("b", "7. 保存后，以后插上就能直接读电量。"),
-            ("h", "如果多次都没有电量数据"),
-            ("b", "可能厂家的协议做了加密，这方面需要用户自行解决。"),
-        ]
-        y = 96
-        for kind, text in lines:
-            if kind == "h":
-                cv.create_text(28, y, text=text, anchor="w",
-                               fill=_rgb((245, 245, 247)),
-                               font=self._f(10, True))
-                y += 28
-            else:
-                cv.create_text(28, y, text=text, anchor="w",
-                               fill=_rgb((175, 178, 184)),
-                               font=self._f(9))
-                y += 22
-        cv.create_text(28, H - 12, text="点击右上角 ✕ 关闭",
-                       anchor="w", fill=_rgb((120, 123, 128)),
-                       font=self._f(8))
-        self._cap_button(28, 400, 110, 30, "开始抓包", "cap_start",
-                         enabled=not self._capturing)
-        self._cap_button(150, 400, 80, 30, "停止", "cap_stop",
-                         enabled=self._capturing)
+        # 说明卡片
+        top, bot = 78, 424
+        cv.create_image(16, top, anchor="nw",
+                        image=self._rr(W - 32, bot - top, 6, c["card"],
+                                       c["stroke"]))
+        self._ctext(32, top + 22, "为什么读不到", c["text"],
+                    self._f(11, True), anchor="w")
+        self._ctext(32, top + 44, "接收器在，但厂商协议未收录；软件只做只读试探。",
+                    c["sub"], self._f(10), anchor="w")
+        self._ctext(32, top + 78, "操作步骤", c["text"], self._f(11, True),
+                    anchor="w")
+        y = top + 104
+        for i, text in enumerate(self.STEPS, 1):
+            cv.create_image(32, y - 10, anchor="nw",
+                            image=self._disc(20, c["well"]))
+            self._ctext(42, y, str(i), c["text"], self._fn(9), anchor="center")
+            self._ctext(62, y, text, c["sub"], self._f(10), anchor="w")
+            y += 28
+        self._ctext(32, y + 8, "如果多次都没有电量数据", c["text"],
+                    self._f(11, True), anchor="w")
+        self._ctext(32, y + 30, "可能厂家的协议做了加密，这方面需要用户自行解决。",
+                    c["sub"], self._f(10), anchor="w")
+
+        # 操作区
+        by = 440
+        x = 16
+        self._button(x, by, 112, 32, "开始抓包", lambda: self._cap_click(
+            "cap_start"), kind="accent", enabled=not self._capturing,
+            tag="btn_cap_start")
+        x += 120
+        self._button(x, by, 80, 32, "停止", lambda: self._cap_click(
+            "cap_stop"), enabled=self._capturing, tag="btn_cap_stop")
+        x += 88
         if self._ambiguous:
-            self._cap_button(242, 400, 100, 30, "清理抓包", "cap_clear",
-                             enabled=not self._capturing)
-        cv.create_text(28, 450, text=self._cap_status, anchor="nw",
-                       fill=_rgb((150, 153, 158)), font=self._f(8),
-                       width=(W - 56), justify="left")
+            self._button(x, by, 96, 32, "清理抓包", lambda: self._cap_click(
+                "cap_clear"), enabled=not self._capturing,
+                tag="btn_cap_clear")
+        self._link(W - 24, by + 8, "下载 USBPcap", self._open_site,
+                   "lnk_site", size=9, anchor="e")
+        self._link(W - 24, by + 25, "指定 USBPcapCMD 路径",
+                   lambda: self._cap_click("cap_path"), "lnk_path", size=9,
+                   anchor="e")
+
+        # 状态信息条
+        iy = 488
+        cv.create_image(16, iy, anchor="nw",
+                        image=self._rr(W - 32, 64, 6, c["info"], c["stroke"]))
+        self._ctext(36, iy + 20, GLYPH["info"], c["link"], self._fi(14))
+        cv.create_text(58, iy + 12, text=self._cap_status, anchor="nw",
+                       fill=_rgb(c["text"]), font=self._f(10),
+                       width=(W - 32 - 58) * self.S, justify="left")
         cv.scale("all", 0, 0, self.S, self.S)
-
-    def _close_hover(self, e=None):
-        for item in self.cv.find_withtag("help_close"):
-            if self.cv.type(item) == "oval":
-                self.cv.itemconfigure(item, fill=_rgb((196, 43, 28)),
-                                      outline=_rgb((196, 43, 28)))
-        txt = [i for i in self.cv.find_withtag("help_close")
-               if self.cv.type(i) == "text"]
-        for i in txt:
-            self.cv.itemconfigure(i, fill=_rgb((255, 255, 255)))
-        self.cv.configure(cursor="hand2")
-
-    def _close_leave(self, e=None):
-        for item in self.cv.find_withtag("help_close"):
-            if self.cv.type(item) == "oval":
-                self.cv.itemconfigure(item, fill=_rgb((27, 27, 28)),
-                                      outline=_rgb((27, 27, 28)))
-        for i in [i for i in self.cv.find_withtag("help_close")
-                  if self.cv.type(i) == "text"]:
-            self.cv.itemconfigure(i, fill=_rgb((160, 163, 168)))
-        self.cv.configure(cursor="")
-
-    def _on_press(self, e):
-        try:
-            if getattr(self, "shadow", None):
-                self.shadow.show(self.root.winfo_x(), self.root.winfo_y())
-                self.root.after(
-                    60, lambda: self.shadow.show(
-                        self.root.winfo_x(), self.root.winfo_y())
-                    if (self.shadow and self.root.winfo_viewable()) else None)
-        except Exception:
-            pass
-        self._drag = None
-        if e.y >= 64 * self.S:
-            return
-        if "help_close" in self.cv.gettags("current"):
-            return
-        self._drag = (e.x_root, e.y_root,
-                      self.root.winfo_x(), self.root.winfo_y())
-
-    def _on_drag(self, e):
-        if not self._drag:
-            return
-        x0, y0, wx, wy = self._drag
-        dx = e.x_root - x0
-        dy = e.y_root - y0
-        if abs(dx) < 3 and abs(dy) < 3:
-            return
-        nx = wx + dx
-        ny = wy + dy
-        self.root.geometry(f"+{nx}+{ny}")
-        if self.shadow:
-            try:
-                self.shadow.move(nx, ny)
-            except Exception:
-                pass
-
-    def _on_release(self, e):
-        self._drag = None
-
-    def _cap_button(self, x, y, w, h, label, tag, enabled=True):
-        cv = self.cv
-        fill = (42, 43, 46) if enabled else (30, 31, 34)
-        border = (58, 59, 64) if enabled else (40, 41, 45)
-        col = (245, 245, 247) if enabled else (110, 112, 116)
-        draw_round_rect(cv, x, y, x + w, y + h, 8, fill=_rgb(fill),
-                        outline=_rgb(border), width=1, tags=(tag,))
-        cv.create_text(x + w / 2, y + h / 2, text=label, fill=_rgb(col),
-                       font=self._f(9, True), tags=(tag,))
-        cv.tag_bind(tag, "<Button-1>", lambda e, t=tag: self._cap_click(t))
-        cv.tag_bind(tag, "<Enter>", lambda e: cv.configure(cursor="hand2"))
-        cv.tag_bind(tag, "<Leave>", lambda e: cv.configure(cursor=""))
 
     def _cap_click(self, tag):
         if tag == "cap_start":
@@ -3384,104 +3757,102 @@ class HelpWindow:
         self.parent._help_win = None
 
 
-class AddDeviceWindow:
-    """发现新设备时的 DSH 风格确认窗口。"""
+class AddDeviceWindow(_Fluent):
+    """发现新设备时的确认对话框（Fluent ContentDialog）。"""
 
-    LW, LH = 380, 240
+    LW, LH = 400, 252
 
-    def __init__(self, app, vid: int, pid: int, name: str,
-                 level=None):
+    def __init__(self, app, vid: int, pid: int, name: str, level=None):
         self.app = app
         self.vid = vid
         self.pid = pid
         self.name = name
         self.level = level
         self.parent = app.panel
-        self.S = max(1.0, UI_SCALE)
-        self.W = int(self.LW * self.S)
-        self.H = int(self.LH * self.S)
         self.root = tk.Toplevel(self.parent.root)
-        try:
-            self.root.transient(self.parent.root)
-        except Exception:
-            pass
+        self.root.title("发现新设备")
         self.root.overrideredirect(True)
-        self.root.configure(bg="#1B1B1C")
+        self._fl_init(app.theme_light)
+        self.W = self._px(self.LW)
+        self.H = self._px(self.LH)
+        self.root.configure(bg=_rgb(self.c["bg"]))
         try:
             self.root.attributes("-topmost", True)
+            self.root.attributes("-alpha", 0.0)
         except Exception:
             pass
         self.cv = tk.Canvas(self.root, width=self.W, height=self.H,
-                            highlightthickness=0, bd=0, bg="#1B1B1C")
+                            highlightthickness=0, bd=0,
+                            bg=_rgb(self.c["bg"]))
         self.cv.pack(fill="both", expand=True)
-        self.cv.bind("<Button-1>", self._on_click)
+        self.cv.bind("<Button-1>", lambda e: self._drag_press(
+            e, 52, ("btn_",)))
+        self.cv.bind("<B1-Motion>", self._drag_move)
+        self.cv.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag",
+                                                            None))
+        self.root.bind("<Return>", lambda e: self._done(True))
+        self.root.bind("<Escape>", lambda e: self._done(False))
+        self._center_on_work_area()
         self.root.update_idletasks()
-        set_round_region(self.root.winfo_id(), self.W, self.H,
-                         int(24 * self.S))
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        x = (sw - self.W) // 2
-        y = (sh - self.H) // 2
-        self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
         self.hwnd = self.root.winfo_id()
+        apply_fluent_frame(self.root, self.W, self.H, self._px(8),
+                           self.c["stroke"])
         self.shadow = None
+        if not IS_WIN11:
+            try:
+                self.shadow = ShadowWindow(self)
+            except Exception:
+                self.shadow = None
         self.render()
         try:
+            self.root.attributes("-alpha", 1.0)
             self.root.update_idletasks()
             if self.shadow:
                 self.shadow.show(self.root.winfo_x(), self.root.winfo_y())
+            self.root.focus_force()
         except Exception:
             pass
 
-    def _f(self, size, bold=False):
-        return (FONT, -int(round(size * self.S)),
-                "bold" if bold else "normal")
-
     def render(self):
+        c = self.c
         cv = self.cv
         cv.delete("all")
-        cv.create_rectangle(0, 0, self.LW, self.LH,
-                            fill="#1B1B1C", outline="")
-        draw_round_rect(cv, 1, 1, self.LW - 1, self.LH - 1, 12,
-                        fill="", outline="#3C3C3C", width=2)
-        cv.create_text(24, 28, text="发现新设备", anchor="w",
-                       fill="#F5F5F7", font=self._f(16, True))
-        cv.create_text(24, 70, text=self.name or "未知设备", anchor="w",
-                       fill="#F5F5F7", font=self._f(14, True))
-        cv.create_text(24, 98, anchor="w",
-                       text=f"{self.vid:04X}:{self.pid:04X}",
-                       fill="#A0A3A8", font=self._f(9))
-        if self.level is not None:
-            cv.create_text(24, 122, text=f"当前电量 {self.level}%",
-                           anchor="w", fill="#22C55E",
-                           font=self._f(10, True))
-        cv.create_text(24, 152, text="添加设备后，双击设备名可以改名",
-                       anchor="w", fill="#787B80", font=self._f(8))
-        draw_round_rect(cv, 24, 188, 164, 222, 8,
-                        fill="#22C55E", outline="#22C55E",
-                        tags=("add",))
-        cv.create_text(94, 205, text="添加", fill="#121416",
-                       font=self._f(10, True), tags=("add",))
-        draw_round_rect(cv, 180, 188, 320, 222, 8,
-                        fill="#1B1B1C", outline="#303136", width=1,
-                        tags=("cancel",))
-        cv.create_text(250, 205, text="暂不", fill="#A0A3A8",
-                       font=self._f(10, True), tags=("cancel",))
-        cv.tag_bind("add", "<Button-1>", lambda e: self._done(True))
-        cv.tag_bind("cancel", "<Button-1>", lambda e: self._done(False))
-        for t in ("add", "cancel"):
-            cv.tag_bind(t, "<Enter>",
-                        lambda e: cv.configure(cursor="hand2"))
-            cv.tag_bind(t, "<Leave>", lambda e: cv.configure(cursor=""))
+        self._btns = {}
+        W, H = self.LW, self.LH
+        cv.create_rectangle(0, 0, W, H, fill=_rgb(c["bg"]), outline="")
+        self._ctext(24, 34, "发现新设备", c["text"], self._f(15, True),
+                    anchor="w")
+        cv.create_image(24, 64, anchor="nw",
+                        image=self._rr(W - 48, 72, 6, c["card"], c["stroke"]))
+        cv.create_image(38, 82, anchor="nw", image=self._disc(36, c["well"]))
+        self._ctext(56, 100, _device_glyph(self.name), c["text"],
+                    self._fi(16))
+        self._ctext(88, 90, self._fit(self.name or "未知设备",
+                                      self._f(12, True), W - 48 - 64 - 64),
+                    c["text"], self._f(12, True), anchor="w")
+        self._ctext(88, 112, f"{self.vid:04X}:{self.pid:04X}", c["sub"],
+                    self._f(10), anchor="w")
+        rx = W - 24 - 14 - 40
+        col = level_rgb(self.level, c)
+        cv.create_image(rx, 80, anchor="nw",
+                        image=self._ring(40, 4, self.level, col))
+        self._ctext(rx + 20, 100, "–" if self.level is None
+                    else str(self.level), c["text"] if self.level is not None
+                    else c["dim"], self._fn(10))
+        self._ctext(24, 160, "添加后会显示在托盘和电量面板里，双击设备名可以改名。",
+                    c["sub"], self._f(10), anchor="w")
+        # 底部按钮带
+        fy = H - 72
+        cv.create_rectangle(0, fy, W, H, fill=_rgb(c["footer"]), outline="")
+        cv.create_line(0, fy, W, fy, fill=_rgb(c["divider"]),
+                       width=self._px(1))
+        bw = (W - 48 - 8) / 2
+        self._button(24, fy + 20, bw, 32, "添加", lambda: self._done(True),
+                     kind="accent", bg=c["footer"], tag="btn_add")
+        self._button(24 + bw + 8, fy + 20, bw, 32, "暂不",
+                     lambda: self._done(False), bg=c["footer"],
+                     tag="btn_cancel")
         cv.scale("all", 0, 0, self.S, self.S)
-
-    def _on_click(self, e):
-        x = e.x / self.S
-        y = e.y / self.S
-        if 24 <= x <= 164 and 188 <= y <= 222:
-            self._done(True)
-        elif 180 <= x <= 320 and 188 <= y <= 222:
-            self._done(False)
 
     def _done(self, ok: bool):
         if ok:
@@ -3501,237 +3872,334 @@ class AddDeviceWindow:
         self.app._add_win = None
 
 
-class CardMenu:
-    """卡片右键菜单：DSH 风格的小按钮。"""
+class FluentMenu(_Fluent):
+    """卡片右键菜单。items: [(glyph, 文字, 回调) | None(分隔线)]。"""
 
-    LW, LH = 140, 44
+    LW = 200
+    ROW = 32
 
-    def __init__(self, panel, key, x_root, y_root):
+    def __init__(self, panel, items, x_root, y_root):
         self.panel = panel
-        self.key = key
-        self.S = panel.S
-        self.W = int(self.LW * self.S)
-        self.H = int(self.LH * self.S)
+        self.items = items
         self.root = tk.Toplevel(panel.root)
-        try:
-            self.root.transient(panel.root)
-        except Exception:
-            pass
         self.root.overrideredirect(True)
-        self.root.configure(bg="#1B1B1C")
+        self._fl_init(panel.light)
+        self.LH = 8 + sum(self.ROW if it else 9 for it in items)
+        self.W = self._px(self.LW)
+        self.H = self._px(self.LH)
+        bg = _rgb(self.c["menu"])
+        self.root.configure(bg=bg)
         try:
             self.root.attributes("-topmost", True)
         except Exception:
             pass
         self.cv = tk.Canvas(self.root, width=self.W, height=self.H,
-                            highlightthickness=0, bd=0, bg="#1B1B1C")
+                            highlightthickness=0, bd=0, bg=bg)
         self.cv.pack(fill="both", expand=True)
-        self.cv.bind("<Button-1>", lambda e: self._delete())
+        _l, _t, r, b, _sw, _sh = work_area()
+        x = min(int(x_root), r - self.W - 4)
+        y = int(y_root) if y_root + self.H <= b else int(y_root) - self.H
+        self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
         self.root.update_idletasks()
-        set_round_region(self.root.winfo_id(), self.W, self.H,
-                         int(16 * self.S))
-        self.root.geometry(f"{self.W}x{self.H}+{int(x_root)}+{int(y_root)}")
         self.hwnd = self.root.winfo_id()
-        self.shadow = None
-        try:
-            self.shadow = ShadowWindow(self)
-        except Exception:
-            self.shadow = None
+        apply_fluent_frame(self.root, self.W, self.H, self._px(8),
+                           self.c["stroke"])
         self.render()
+        self.root.bind("<Escape>", lambda e: self.close())
+        self.root.bind("<FocusOut>", lambda e: self.root.after(
+            80, self._check_focus))
         try:
-            self.root.update_idletasks()
-            if self.shadow:
-                self.shadow.show(self.root.winfo_x(), self.root.winfo_y())
-            self.root.lift()
-            self.root.attributes("-topmost", True)
-            _top = user32.GetAncestor(self.hwnd, 2) or self.hwnd
-            user32.SetWindowPos(_top, -1, 0, 0, 0, 0, 0x0003)
+            self.root.focus_force()
         except Exception:
             pass
 
     def render(self):
+        c = self.c
         cv = self.cv
-        cv.create_rectangle(0, 0, self.LW, self.LH,
-                            fill="#1B1B1C", outline="")
-        draw_round_rect(cv, 1, 1, self.LW - 1, self.LH - 1, 8,
-                        fill="#1B1B1C", outline="#3C3C3C", width=2,
-                        tags=("del",))
-        cv.create_text(self.LW / 2, self.LH / 2, text="删除设备",
-                       fill="#F5F5F7", font=(FONT, -int(round(10 * self.S)),
-                                             "normal"), tags=("del",))
-        cv.tag_bind("del", "<Button-1>", lambda e: self._delete())
-        cv.tag_bind("del", "<Enter>",
-                    lambda e: cv.configure(cursor="hand2"))
-        cv.tag_bind("del", "<Leave>", lambda e: cv.configure(cursor=""))
+        W = self.LW
+        cv.create_rectangle(0, 0, W, self.LH, fill=_rgb(c["menu"]),
+                            outline="")
+        if not IS_WIN11:
+            cv.create_image(0, 0, anchor="nw", image=self._rr(
+                W, self.LH, 8, None, c["ctl_stroke"]))
+        y = 4
+        for i, it in enumerate(self.items):
+            if it is None:
+                cv.create_line(4, y + 4, W - 4, y + 4,
+                               fill=_rgb(c["divider"]), width=self._px(1))
+                y += 9
+                continue
+            glyph, label, cmd = it
+            tag = f"mi_{i}"
+            cv.create_rectangle(4, y, W - 4, y + self.ROW,
+                                fill=_rgb(c["menu"]), outline="", tags=(tag,))
+            hv = cv.create_image(4, y + 2, anchor="nw", tags=(tag,),
+                                 state="hidden",
+                                 image=self._rr(W - 8, self.ROW - 4, 4,
+                                                c["menu_hover"]))
+            self._ctext(24, y + self.ROW / 2, glyph, c["text"], self._fi(12),
+                        tags=(tag,))
+            self._ctext(44, y + self.ROW / 2, label, c["text"], self._f(10),
+                        tags=(tag,), anchor="w")
+            cv.tag_bind(tag, "<Enter>", lambda e, h=hv: cv.itemconfigure(
+                h, state="normal"))
+            cv.tag_bind(tag, "<Leave>", lambda e, h=hv: cv.itemconfigure(
+                h, state="hidden"))
+            cv.tag_bind(tag, "<ButtonRelease-1>",
+                        lambda e, f=cmd: self._pick(f))
+            y += self.ROW
         cv.scale("all", 0, 0, self.S, self.S)
 
-    def _delete(self):
-        try:
-            self.panel.delete_device(self.key)
-        except Exception:
-            pass
+    def _pick(self, cmd):
         self.close()
-
-    def close(self):
         try:
-            if self.shadow:
-                self.shadow.destroy()
+            cmd()
         except Exception:
             pass
+
+    def _check_focus(self):
+        try:
+            f = self.root.focus_get()
+        except Exception:
+            f = None
+        try:
+            if f is not None and f.winfo_toplevel() is self.root:
+                return
+        except Exception:
+            pass
+        self.close(refocus=False)
+        self.panel._check_dismiss()
+
+    def close(self, refocus: bool = True):
         try:
             self.root.destroy()
         except Exception:
             pass
         if getattr(self.panel, "_menu", None) is self:
             self.panel._menu = None
+        # 焦点还给面板，之后点外面才能照常收起
+        if refocus and self.panel.visible:
+            try:
+                self.panel.root.focus_force()
+            except Exception:
+                pass
 
 
-class Panel:
-    LW, LH = 560, 399
+class Panel(_Fluent):
+    """托盘弹出面板：仿 Windows 11 快速设置 / 电池浮出窗口。"""
 
-    def _f(self, size, bold=False):
-        return (FONT, -int(round(size * self.S)),
-                "bold" if bold else "normal")
+    LW = 360
+    HEAD_H = 52
+    FOOT_H = 52
+    CARD_H = 64
+    GAP = 4
+    MAX_ROWS = 5
+    EMPTY_H = 148
 
     def __init__(self, app: "TrayApp"):
         self.app = app
-        self.S = max(1.0, UI_SCALE)
-        self.W = int(self.LW * self.S)
-        self.H = int(self.LH * self.S)
         self.root = tk.Tk()
         self.root.title("2.4G")
         self.root.overrideredirect(True)
-        self.root.configure(bg="#0B1322")
-        self.light = app.theme_light
+        self._fl_init(app.theme_light)
+        self.W = self._px(self.LW)
+        self.LH = self.HEAD_H + self.EMPTY_H + 12 + self.FOOT_H
+        self.H = self._px(self.LH)
+        self.root.configure(bg=_rgb(self.c["bg"]))
         self.cv = tk.Canvas(self.root, width=self.W, height=self.H,
-                            highlightthickness=0, bd=0, bg="#0B1322")
+                            highlightthickness=0, bd=0,
+                            bg=_rgb(self.c["bg"]))
         self.cv.pack(fill="both", expand=True)
-        self.cv.bind("<Button-1>", self._on_press)
-        self.cv.bind("<B1-Motion>", self._on_drag)
-        self.cv.bind("<ButtonRelease-1>", self._on_release)
-        self.root.bind_all("<Button-1>", self._maybe_commit, add="+")
+        self.cv.bind("<Button-3>", self._on_right_click)
+        self.cv.bind("<MouseWheel>", self._on_wheel)
+        self.root.bind("<MouseWheel>", self._on_wheel)
         self.root.bind("<Escape>", lambda e: self.hide())
-        self._drag = None
+        self.root.bind("<FocusOut>", self._on_focus_out, add="+")
+        self.root.bind_all("<Button-1>", self._maybe_commit, add="+")
+        if app.panel_only:
+            self.cv.bind("<Button-1>", lambda e: self._drag_press(
+                e, self.HEAD_H, ("btn_",)))
+            self.cv.bind("<B1-Motion>", self._drag_move)
+            self.cv.bind("<ButtonRelease-1>",
+                         lambda e: setattr(self, "_drag", None))
         self._entry = None
         self._entry_key = None
         self._entry_win = None
         self._entry_item = None
         self._entry_guard = 0.0
-        self._help_win = None
         self._name_font = None
         self._name_limit_px = 0
         self._name_max_chars = 0
+        self._help_win = None
+        self._menu = None
+        self._modal = False
         self._scroll = 0.0
         self._max_scroll = 0.0
         self._card_rects = {}
-        self._menu = None
-        self.cv.bind("<Button-3>", self._on_right_click)
-        self._track_h = 0.0
-        self._thumb_h = 0.0
-        self._bar_drag = None
-        self.cv.bind("<MouseWheel>", self._on_wheel)
-        self.root.bind("<MouseWheel>", self._on_wheel)
-        self._built = False
-        self._startup_var = startup_enabled()
-        self.root.update_idletasks()
-        hwnd = self.root.winfo_id()
-        self.hwnd = hwnd
-        # 圆半径 16px（Region 的椭圆直径是半径的两倍）
-        set_round_region(hwnd, self.W, self.H, int(32 * self.S))
-        try:
-            GCL_STYLE = -26
-            style = user32.GetClassLongPtrW(hwnd, GCL_STYLE)
-            user32.SetClassLongPtrW(hwnd, GCL_STYLE, style | 0x00020000)
-        except Exception:
-            pass
-        # 面板没有输入框：摘掉 IME，避免输入法候条弹在窗口上方
-        try:
-            imm32.ImmAssociateContext.argtypes = [wt.HWND, wt.HANDLE]
-            imm32.ImmAssociateContext(hwnd, None)
-        except Exception:
-            pass
+        self._card_bg = {}
         self._visible = False
-        self._shadow = None
+        self._shown_at = 0.0
+        self._dismissed_at = 0.0
+        self._edge = "bottom"
+        self._startup_var = startup_enabled()
+        self.shadow = None
+        # 先映射一次（全透明）拿到真正的顶层窗口，设好圆角/阴影再藏起来
         try:
-            self._shadow = ShadowWindow(self)
-        except Exception:
-            self._shadow = None
-        self._center()
-        self.root.withdraw()
-
-    def _center(self):
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        x = max(0, (sw - self.W) // 2)
-        y = max(0, (sh - self.H) // 2 - 40)
-        self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
-
-    # -- 交互 --------------------------------------------------------------
-    def _on_press(self, e):
-        if self._menu:
-            try:
-                self._menu.unpost()
-            except Exception:
-                pass
-            self._menu = None
-        try:
-            if getattr(self, "_shadow", None):
-                self._shadow.show(self.root.winfo_x(), self.root.winfo_y())
-                self.root.after(
-                    60, lambda: self._shadow.show(
-                        self.root.winfo_x(), self.root.winfo_y())
-                    if (self._shadow and self.root.winfo_viewable()) else None)
+            self.root.attributes("-alpha", 0.0)
         except Exception:
             pass
-        self._drag = None
-        if e.y >= 64 * self.S:
-            return
-        tags = self.cv.gettags("current")
-        if any(t.startswith(("btn_", "chk_", "fix_")) for t in tags):
-            return
-        self._drag = (e.x_root, e.y_root,
-                      self.root.winfo_x(), self.root.winfo_y())
-
-    def _on_drag(self, e):
-        if not self._drag:
-            return
-        x0, y0, wx, wy = self._drag
-        dx = e.x_root - x0
-        dy = e.y_root - y0
-        if abs(dx) < 3 and abs(dy) < 3:
-            return
-        nx = wx + dx
-        ny = wy + dy
-        self.root.geometry(f"+{nx}+{ny}")
-        if self._shadow:
+        self.root.geometry(f"{self.W}x{self.H}+0+0")
+        self.root.update_idletasks()
+        self.hwnd = self.root.winfo_id()
+        apply_fluent_frame(self.root, self.W, self.H, self._px(8),
+                           self.c["stroke"])
+        if not IS_WIN11:
             try:
-                self._shadow.move(nx, ny)
+                self.shadow = ShadowWindow(self)
             except Exception:
-                pass
+                self.shadow = None
+        self.root.withdraw()
+        self.root.after(300, self._warm_up)
 
-    def _on_release(self, e):
-        self._drag = None
+    @property
+    def visible(self) -> bool:
+        return self._visible
+
+    def _warm_up(self):
+        """提前生成卡片底图，第一次弹出不卡顿。"""
+        try:
+            w = self.LW - 24
+            self._rr(w, self.CARD_H, 6, self.c["card"], self.c["stroke"])
+            self._rr(w, self.CARD_H, 6, self.c["card_hover"],
+                     self.c["stroke"])
+        except Exception:
+            pass
+
+    # -- 显示 / 隐藏 ---------------------------------------------------------
+    def _anchor(self):
+        l, t, r, b, sw, sh = work_area()
+        m = self._px(12)
+        if self.app.panel_only:
+            self._edge = "center"
+            return (l + max(0, (r - l - self.W) // 2),
+                    t + max(0, (b - t - self.H) // 2))
+        if t > 0:
+            self._edge = "top"
+            return r - self.W - m, t + m
+        if l > 0:
+            self._edge = "left"
+            return l + m, b - self.H - m
+        self._edge = "right" if r < sw else "bottom"
+        return r - self.W - m, b - self.H - m
 
     def show(self):
+        if self._visible:
+            try:
+                self.root.lift()
+                self.root.focus_force()
+            except Exception:
+                pass
+            return
         self._visible = True
-        self.light = self.app.theme_light
+        self._startup_var = startup_enabled()
+        self._set_theme(self.app.theme_light)
+        self._scroll = 0.0
         self.render()
+        x, y = self._anchor()
+        try:
+            self.root.attributes("-alpha", 0.0)
+        except Exception:
+            pass
+        self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
         self.root.deiconify()
         try:
-            # 叽顶不抢焦点：避免输入法条弹在面板上方
             self.root.attributes("-topmost", True)
         except Exception:
             pass
-        self.root.lift()
-        if self._shadow:
+        self.root.update_idletasks()
+        apply_fluent_frame(self.root, self.W, self.H, self._px(8),
+                           self.c["stroke"])
+        self._shown_at = time.time()
+        self._animate(x, y, 0)
+        try:
+            self.root.focus_force()
+        except Exception:
+            pass
+
+    def _animate(self, x, y, step):
+        """浮出动画：淡入 + 从任务栏方向滑入 16px。"""
+        if not self._visible:
+            return
+        n = 8
+        e = 1 - (1 - step / n) ** 3
+        off = int(round(self._px(16) * (1 - e)))
+        dx = dy = 0
+        if self._edge == "bottom":
+            dy = off
+        elif self._edge == "top":
+            dy = -off
+        elif self._edge == "right":
+            dx = off
+        elif self._edge == "left":
+            dx = -off
+        try:
+            self.root.geometry(f"+{x + dx}+{y + dy}")
+            self.root.attributes("-alpha", e)
+        except tk.TclError:
+            return
+        if step < n:
+            self.root.after(15, lambda: self._animate(x, y, step + 1))
+        elif self.shadow:
             try:
-                self.root.update_idletasks()
-                self._shadow.show(self.root.winfo_x(), self.root.winfo_y())
+                self.shadow.show(x, y)
             except Exception:
                 pass
 
+    def _on_focus_out(self, e):
+        if self.app.panel_only or not self._visible:
+            return
+        self.root.after(100, self._check_dismiss)
+
+    def _check_dismiss(self):
+        """点到面板以外的地方就收起（Windows 浮出窗口的轻触关闭）。"""
+        if (not self._visible or self.app.panel_only or self._entry
+                or self._menu or self._modal):
+            return
+        if time.time() - self._shown_at < 0.3:
+            return
+        try:
+            f = self.root.focus_get()
+        except Exception:
+            f = None
+        if f is None:
+            self.hide(dismissed=True)
+
+    def hide(self, dismissed: bool = False):
+        if self._entry:
+            self._commit_name(True)
+        self._close_menu()
+        if self.app.panel_only:
+            self.app.quit()
+            return
+        self._withdraw()
+        if dismissed:
+            self._dismissed_at = time.time()
+
+    def _withdraw(self):
+        self._visible = False
+        if self.shadow:
+            try:
+                self.shadow.hide()
+            except Exception:
+                pass
+        try:
+            self.root.attributes("-topmost", False)
+            self.root.withdraw()
+        except Exception:
+            pass
+
     def _close_help(self):
-        hw = getattr(self, "_help_win", None)
+        hw = self._help_win
         if hw:
             try:
                 hw.close()
@@ -3739,538 +4207,332 @@ class Panel:
                 pass
         self._help_win = None
 
-    def hide(self):
-        self._visible = False
-        self._close_help()
-        try:
-            self.root.attributes("-topmost", False)
-        except Exception:
-            pass
-        if getattr(self.app, "panel_only", False):
-            self.app.quit()
-            return
-        if self._shadow:
+    def _close_menu(self):
+        if self._menu:
             try:
-                self._shadow.hide()
+                self._menu.close(refocus=False)
             except Exception:
                 pass
-        self.root.withdraw()
+            self._menu = None
 
     def close(self):
         self._close_help()
-        if self._shadow:
+        self._close_menu()
+        if self.shadow:
             try:
-                self._shadow.destroy()
+                self.shadow.destroy()
             except Exception:
                 pass
-            self._shadow = None
+            self.shadow = None
         try:
             self.root.destroy()
         except Exception:
             pass
 
-    # -- 夜航玻璃绘制（Nocturne Glassmorphism?-----------------------------
-    LW_ID = (11, 19, 34)      # #0B1322
-    LW_NEAR = (6, 10, 19)     # #060A13
-    LW_MOON = (124, 156, 196)
-    LW_STEEL = (51, 81, 122)
-    LW_CHAMP = (228, 184, 99)  # #E4B863
-    LW_CHAMP_L = (243, 220, 168)
-    LW_WHITE = (245, 248, 255)
+    def _resize(self, lh):
+        """设备数变化时改高度，保持贴住任务栏的那条边。"""
+        self.LH = lh
+        H = self._px(lh)
+        if H == self.H:
+            return
+        self.H = H
+        self.cv.configure(width=self.W, height=self.H)
+        if not self._visible:
+            return
+        x, y = self._anchor()
+        self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
+        apply_fluent_frame(self.root, self.W, self.H, self._px(8),
+                           self.c["stroke"])
+        if self.shadow:
+            try:
+                self.shadow.destroy()
+                self.shadow = ShadowWindow(self)
+                self.shadow.show(x, y)
+            except Exception:
+                self.shadow = None
 
-    def _mix(self, a, b, t):
-        return (int(a[0] + (b[0] - a[0]) * t),
-                int(a[1] + (b[1] - a[1]) * t),
-                int(a[2] + (b[2] - a[2]) * t))
-
-    def _wells(self):
-        W, H = self.LW, self.LH
-        return [
-            (W - 20, 6, 300, self.LW_MOON, 0.28),
-            (6, H - 4, 280, self.LW_STEEL, 0.35),
-            (W * 0.52, H * 0.40, 250, self.LW_CHAMP, 0.10),
-        ]
-
-    def _scene_at(self, x, y):
-        t = max(0.0, min(1.0, y / max(1, self.LH - 1)))
-        base = self._mix(self.LW_ID, self.LW_NEAR, t)
-        for cx, cy, rad, col, alpha in self._wells():
-            dx, dy = x - cx, y - cy
-            d = (dx * dx + dy * dy) ** 0.5 / rad
-            if d < 1.0:
-                base = self._mix(base, col, alpha * (1 - d * d) ** 1.5)
-        return base
-
-    def _level_rgb(self, lv):
-        if lv is None:
-            return (109, 127, 150)
-        if lv >= 60:
-            return (61, 220, 151)
-        if lv >= 30:
-            return self.LW_CHAMP
-        return (248, 113, 113)
-
+    # -- 绘制 ----------------------------------------------------------------
     def render(self):
+        if self._entry:
+            return
+        c = self.c
         cv = self.cv
+        snap = self.app.snapshot()
+        keys = list(snap.keys())
+        n = len(keys)
+        if n:
+            vis = min(n, self.MAX_ROWS)
+            list_h = vis * self.CARD_H + (vis - 1) * self.GAP
+            content = n * self.CARD_H + (n - 1) * self.GAP
+        else:
+            list_h = content = self.EMPTY_H
+        self._max_scroll = max(0.0, float(content - list_h))
+        self._scroll = max(0.0, min(self._scroll, self._max_scroll))
+        self._list = (self.HEAD_H, self.HEAD_H + list_h)
+        self._resize(self.HEAD_H + list_h + 12 + self.FOOT_H)
+
         cv.delete("all")
         self._btns = {}
-        W, H = self.LW, self.LH
+        self._card_rects = {}
+        self._card_bg = {}
+        W, LH = self.LW, self.LH
+        top = self.HEAD_H
+        cv.create_rectangle(0, 0, W, LH, fill=_rgb(c["bg"]), outline="")
+        if n:
+            y = top - self._scroll
+            for key in keys:
+                if y + self.CARD_H > top and y < top + list_h:
+                    self._card(12, y, W - 12, y + self.CARD_H, key, snap[key])
+                y += self.CARD_H + self.GAP
+        else:
+            self._empty(12, top, W - 12, top + list_h)
 
-        # 1) 深墨夜景底色
-        for y in range(H):
-            col = self._mix(self.LW_ID, self.LW_NEAR, y / max(1, H - 1))
-            cv.create_line(0, y, W, y, fill=_rgb(col))
+        # 标题栏（同时遮住滚出视口的卡片）
+        cv.create_rectangle(0, 0, W, top, fill=_rgb(c["bg"]), outline="")
+        self._ctext(18, 27, "外设电量", c["text"], self._f(13, True),
+                    anchor="w")
+        if n:
+            tw = tkfont.Font(root=self.root, font=self._f(13, True)).measure(
+                "外设电量") / self.S
+            self._ctext(18 + tw + 8, 28, f"{n} 台设备", c["dim"],
+                        self._f(10), anchor="w")
+        bx = W - 12 - 32
+        if self.app.panel_only:
+            self._button(bx, 10, 32, 32, GLYPH["close"], self.hide,
+                         kind="subtle", tag="btn_close", glyph=True, size=11)
+            bx -= 36
+        self._button(bx, 10, 32, 32, GLYPH["refresh"], self._refresh,
+                     kind="subtle", tag="btn_refresh", glyph=True, size=13)
 
-        # 2) 柔和光源光斑（radial light wells）
-        for cx, cy, rad, col, alpha in self._wells():
-            base = self._mix(self.LW_ID, self.LW_NEAR, cy / max(1, H - 1))
-            steps = 44
-            for i in range(steps, 0, -1):
-                rr = rad * i / steps
-                a = alpha * (1 - (i / steps) ** 2)
-                c = self._mix(base, col, a)
-                cv.create_oval(cx - rr, cy - rr, cx + rr, cy + rr,
-                               fill=_rgb(c), outline="")
-
-        # 3) 2.5% 颗粒噂
-        rnd = random.Random(20261018)
-        for _ in range(900):
-            gx = rnd.uniform(0, W)
-            gy = rnd.uniform(0, H)
-            c = (22, 35, 55) if rnd.random() < 0.45 else (8, 14, 25)
-            cv.create_line(gx, gy, gx + 1, gy, fill=_rgb(c))
-
-        # 4) 窗口顶边受光
-        cv.create_line(20, 1, W - 20, 1,
-                       fill=_rgb(self._mix(self._scene_at(W / 2, 1),
-                                           self.LW_WHITE, 0.25)))
-
-        # 5) 标
-        cv.create_text(30, 34, text="外设电量", anchor="w",
-                       fill=_rgb(self.LW_WHITE), font=self._f(20, True))
-        iv = self.app.interval
-        iv_text = (f"每 {iv // 60} 分钟自动刷新" if iv % 60 == 0
-                   else f"每 {iv} 秒自动刷新")
-        cv.create_text(30, 58, text="2.4G 无线外设 · " + iv_text, anchor="w",
-                       fill=_rgb((150, 167, 189)), font=self._f(9))
-        self._button(W - 44, 22, 28, 28, "×", self.hide)
-
-        # 6) 玻璃卡片
-        self._card(24, 88, W - 24, 210, "mouse")
-        self._card(24, 222, W - 24, 344, "headset")
-
-        # 7) 底部
-        cv.create_text(28, 384, text=self._updated_text(), anchor="w",
-                       fill=_rgb((109, 127, 150)), font=self._f(9))
-        self._check(316, 372, self._startup_var, "开机自启",
-                    lambda: self._toggle_startup())
-        self._button(498, 364, 52, 26, "退出", self.app.quit)
+        # 底栏
+        fy = top + list_h + 12
+        cv.create_rectangle(0, top + list_h, W, fy, fill=_rgb(c["bg"]),
+                            outline="")
+        cv.create_rectangle(0, fy, W, LH, fill=_rgb(c["footer"]), outline="")
+        cv.create_line(0, fy, W, fy, fill=_rgb(c["divider"]),
+                       width=self._px(1))
+        self._ctext(18, fy + self.FOOT_H / 2, self._updated_text(), c["sub"],
+                    self._f(10), anchor="w")
+        tx = W - 18 - 40
+        self._toggle(tx, fy + (self.FOOT_H - 20) / 2, self._startup_var)
+        self._ctext(tx - 10, fy + self.FOOT_H / 2, "开机自启", c["text"],
+                    self._f(10), anchor="e", tags=("tog",))
+        if not IS_WIN11:
+            cv.create_image(0, 0, anchor="nw", image=self._rr(
+                W, LH, 8, None, c["ctl_stroke"]))
+        self._scrollbar()
         cv.scale("all", 0, 0, self.S, self.S)
 
     def _updated_text(self) -> str:
+        if self.app._refreshing:
+            return "正在刷新…"
         rs = self.app.snapshot()
-        times = [r.ts for r in rs.values() if r.ts]
+        times = [r.ts for r in rs.values() if r.ts and not r.stale]
         if not times:
-            return "尚未读取"
-        return "上次更新 " + time.strftime("%H:%M:%S", time.localtime(max(times)))
+            return "尚未读取" if not rs else "暂无新读数"
+        return "上次更新 " + time.strftime("%H:%M:%S",
+                                          time.localtime(max(times)))
 
-    def _glass_panel(self, x1, y1, x2, y2, rad, alpha=0.09):
-        """绘制玻璃面板。"""
+    def _subtitle(self, r: Reading):
+        """返回 (文字, 是否附带“设置读取”链接)。"""
+        if r.status == "unknown_proto":
+            return "协议未知", True
+        if r.stale:
+            return r.detail or "上次读数", False
+        if r.status == "asleep":
+            return r.detail or "设备休眠", False
+        if not r.present or r.status == "unplugged":
+            return "未连接", False
+        if r.ok:
+            st = STATUS_TEXT.get(r.status, "")
+            if r.status not in ("charging", "full", "wired"):
+                st = "已连接"
+            meta = f"{r.vid:04X}:{r.pid:04X}" if r.vid else ""
+            return (f"{st} · {meta}" if meta else st), False
+        return r.detail or "未连接", False
+
+    def _card(self, x1, y1, x2, y2, key, r: Reading):
+        c = self.c
         cv = self.cv
-        cx = (x1 + x2) / 2
-        for yy in range(int(y1) + 1, int(y2)):
-            inset = 0
-            dtop = yy - y1
-            dbot = y2 - yy
-            if dtop < rad:
-                inset = max(inset, rad - math.isqrt(
-                    max(0, int(rad * rad - (rad - dtop) ** 2))))
-            if dbot < rad:
-                inset = max(inset, rad - math.isqrt(
-                    max(0, int(rad * rad - (rad - dbot) ** 2))))
-            c = self._mix(self._scene_at(cx, yy), self.LW_WHITE, alpha)
-            cv.create_line(x1 + inset + 1, yy, x2 - inset - 1, yy,
-                           fill=_rgb(c))
-
-    def _on_right_click(self, e):
-        if self._menu:
-            try:
-                self._menu.unpost()
-            except Exception:
-                pass
-            self._menu = None
-        ly = e.y / self.S
-        lx = e.x / self.S
-        for key, (x1, y1, x2, y2) in self._card_rects.items():
-            if x1 <= lx <= x2 and y1 <= ly <= y2:
-                menu = tk.Menu(
-                    self.root, tearoff=0, bg="#1B1B1C", fg="#F5F5F7",
-                    activebackground="#2A2B2E",
-                    activeforeground="#F5F5F7", bd=0, relief="flat")
-                menu.add_command(
-                    label="删除设备",
-                    command=lambda k=key: self.delete_device(k))
-                self._menu = menu
-                menu.bind("<Unmap>", lambda ev: self._clear_menu())
-                menu.tk_popup(e.x_root, e.y_root)
-                return
-
-    def _clear_menu(self):
-        self._menu = None
-
-    def delete_device(self, key: str):
-        if self._menu:
-            try:
-                self._menu.unpost()
-            except Exception:
-                pass
-            self._menu = None
-        try:
-            self.app.remove_device(key)
-        except Exception:
-            pass
-
-    def _card(self, x1, y1, x2, y2, key):
-        cv = self.cv
+        tag = f"card_{key}"
+        w, h = x2 - x1, y2 - y1
+        normal = self._rr(w, h, 6, c["card"], c["stroke"])
+        hover = self._rr(w, h, 6, c["card_hover"], c["stroke"])
+        bg = cv.create_image(x1, y1, image=normal, anchor="nw", tags=(tag,))
         self._card_rects[key] = (x1, y1, x2, y2)
-        r = (self.app.snapshot().get(key)
-             or Reading(ok=False, name="设备"))
-        rad = 20
-        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-        base = self._scene_at(cx, cy)
+        self._card_bg[key] = (bg, normal, hover)
+        cy = (y1 + y2) / 2
+        cv.create_image(x1 + 14, cy - 18, anchor="nw", tags=(tag,),
+                        image=self._disc(36, c["well"]))
+        self._ctext(x1 + 32, cy, _device_glyph(r.name), c["text"],
+                    self._fi(15), tags=(tag,))
 
-        # 外层深度阴影（方向向下，多层实色避免点阵感）
-        for off, dark, grow in ((12, 0.45, 2), (8, 0.40, 1), (4, 0.35, 0)):
-            c = self._mix(self._scene_at(cx, y2), (0, 0, 0), dark)
-            draw_round_rect(cv, x1 - grow, y1 + off, x2 + grow, y2 + off,
-                            rad + grow, fill=_rgb(c), outline="")
+        tx = x1 + 62
+        ring = 40
+        rx = x2 - 14 - ring
+        name_font = self._f(11, True)
+        self._ctext(tx, cy - 10, self._fit(r.name or "设备", name_font,
+                                           rx - 12 - tx),
+                    c["text"], name_font, anchor="w",
+                    tags=(tag, f"nm_{key}"))
+        cv.tag_bind(f"nm_{key}", "<Double-Button-1>",
+                    lambda e, k=key, x=tx * self.S, y=(cy - 10) * self.S:
+                    self._edit_name(k, x, y))
+        sub, need_fix = self._subtitle(r)
+        sub_font = self._f(9)
+        sub = self._fit(sub, sub_font, rx - 12 - tx - (64 if need_fix else 0))
+        item = self._ctext(tx, cy + 12, sub, c["sub"], sub_font, anchor="w",
+                           tags=(tag,))
+        if need_fix:
+            try:
+                sx = cv.bbox(item)[2] + 8
+            except Exception:
+                sx = tx + 60
+            self._link(sx, cy + 12, "设置读取", lambda k=key: self.open_help(k),
+                       f"fix_{key}", size=9)
 
-        # 无色玻璃：薄薄一层 8% 白，保留光斑的明暗
-        self._glass_panel(x1, y1, x2, y2, rad)
-        border = self._mix(self._scene_at(cx, y1), self.LW_WHITE, 0.18)
-        draw_round_rect(cv, x1, y1, x2, y2, rad,
-                        fill="", outline=_rgb(border), width=1)
-
-        # 方向性光：顶边受?+ 底边暗缘
-        cv.create_line(x1 + rad, y1 + 1, x2 - rad, y1 + 1,
-                       fill=_rgb(self._mix(base, self.LW_WHITE, 0.22)))
-        cv.create_line(x1 + rad, y2 - 1, x2 - rad, y2 - 1,
-                       fill=_rgb(self._mix(base, (0, 0, 0), 0.35)))
-
-        # 内发光：顶部 12% ?透明
-        for i in range(6):
-            yy = y1 + 2 + i * 3
-            a = 0.12 * (1 - i / 6)
-            cv.create_line(x1 + rad, yy, x2 - rad, yy,
-                           fill=_rgb(self._mix(base, self.LW_WHITE, a)))
-
-        cv.create_text(x1 + 22, y1 + 24, text=r.name or "设备", anchor="w",
-                       fill=_rgb(self.LW_WHITE), font=self._f(13, True))
-        if r.ok and not r.stale and r.status == "wired":
-            src = "有线模式 · " + (r.source or r.detail)
+        lv = r.level if (r.ok and r.level is not None) else None
+        col = level_rgb(lv, c)
+        if r.stale and lv is not None:
+            col = _mix(col, c["track"], 0.45)
+        cv.create_image(rx, cy - ring / 2, anchor="nw", tags=(tag,),
+                        image=self._ring(ring, 4, lv, col))
+        if lv is None:
+            self._ctext(rx + ring / 2, cy, "–", c["dim"], self._fn(11),
+                        tags=(tag,))
         else:
-            src = (r.detail if r.stale else
-                   (r.source or r.detail) if r.ok else (r.detail or r.source))
-        cv.create_text(x1 + 22, y1 + 50, text=src[:46], anchor="w",
-                       fill=_rgb((150, 167, 189)), font=self._f(9))
+            self._ctext(rx + ring / 2, cy, str(lv),
+                        c["sub"] if r.stale else c["text"],
+                        self._fn(10 if lv >= 100 else 11), tags=(tag,))
+        cv.tag_bind(tag, "<Enter>", lambda e, k=key: self._hover_card(k, True))
+        cv.tag_bind(tag, "<Leave>", lambda e, k=key: self._hover_card(k, False))
 
-        lv = r.level if r.ok else None
-        if r.ok and lv is not None:
-            cv.create_text(x2 - 46, y1 + 44, text=str(lv), anchor="e",
-                           fill=_rgb(self.LW_CHAMP), font=self._f(34, True))
-            cv.create_text(x2 - 24, y1 + 44, text="%", anchor="e",
-                           fill=_rgb(self.LW_CHAMP_L), font=self._f(12, True))
-        else:
-            cv.create_text(x2 - 26, y1 + 44, text="未连接", anchor="e",
-                           fill=_rgb((109, 127, 150)), font=self._f(16, True))
-
-        # 进度条：玻璃轨道 + 电量色填充
-        bx1, bx2 = x1 + 22, x2 - 22
-        by = y2 - 26
-        draw_round_rect(cv, bx1, by, bx2, by + 8, 4,
-                        fill=_rgb(self._mix(self._scene_at((bx1 + bx2) / 2, by),
-                                            self.LW_WHITE, 0.10)), outline="")
-        if lv is not None and lv > 0:
-            w = int((bx2 - bx1) * lv / 100)
-            draw_round_rect(cv, bx1, by, bx1 + max(8, w), by + 8, 4,
-                            fill=_rgb(self._level_rgb(lv)), outline="")
-        status = STATUS_TEXT.get(r.status, "")
-        if r.ok and status and r.status != "unknown":
-            cv.create_text(x1 + 22, y2 - 42, text=status, anchor="w",
-                           fill=_rgb((150, 167, 189)), font=self._f(9))
-
-    def _button(self, x, y, w, h, text, cmd, primary=False):
-        tag = f"btn_{text}_{x}"
-        base = self._scene_at(x + w / 2, y + h / 2)
-        if primary:
-            fill = self._mix(base, self.LW_CHAMP, 0.15)
-            border = self._mix(base, self.LW_CHAMP, 0.40)
-            bright = self._mix(base, self.LW_CHAMP, 0.60)
-            col = self.LW_CHAMP_L
-        else:
-            fill = self._mix(base, self.LW_WHITE, 0.08)
-            border = self._mix(base, self.LW_WHITE, 0.20)
-            bright = self._mix(base, self.LW_WHITE, 0.35)
-            col = self.LW_WHITE
-        poly = draw_round_rect(self.cv, x, y, x + w, y + h, h / 2,
-                               fill=_rgb(fill), outline=_rgb(border),
-                               width=1, tags=(tag,))
-        self.cv.create_text(x + w / 2, y + h / 2, text=text,
-                            fill=_rgb(col), font=self._f(9), tags=(tag,))
-        self._btns[tag] = (poly, border, bright, False)
-        self.cv.tag_bind(tag, "<Button-1>", lambda e: cmd())
-        self.cv.tag_bind(tag, "<Enter>", lambda e: self._hover_btn(tag, True))
-        self.cv.tag_bind(tag, "<Leave>", lambda e: self._hover_btn(tag, False))
-
-    def _hover_btn(self, tag, on):
-        info = self._btns.get(tag)
+    def _hover_card(self, key, on):
+        info = self._card_bg.get(key)
         if not info:
             return
-        poly, border, bright, state = info
-        if state == on:
-            return
-        self._btns[tag] = (poly, border, bright, on)
-        # 只提亮边框、不移动按钮：移动会让鼠标压边时 Enter/Leave 无限抖动
-        self.cv.itemconfigure(poly, outline=_rgb(bright if on else border),
-                              width=2 if on else 1)
+        item, normal, hover = info
+        try:
+            self.cv.itemconfigure(item, image=hover if on else normal)
+        except tk.TclError:
+            pass
 
-    def _check(self, x, y, checked, label, cmd):
-        tag = f"chk_{label}"
-        base = self._scene_at(x, y)
-        if checked:
-            fill = self._mix(base, self.LW_CHAMP, 0.85)
-            border = self._mix(base, self.LW_CHAMP, 0.95)
-        else:
-            fill = self._mix(base, self.LW_WHITE, 0.06)
-            border = self._mix(base, self.LW_WHITE, 0.18)
-        draw_round_rect(self.cv, x, y + 4, x + 16, y + 20, 5,
-                        fill=_rgb(fill), outline=_rgb(border), width=1,
-                        tags=(tag,))
-        if checked:
-            self.cv.create_line(x + 4, y + 12, x + 7, y + 15, x + 12, y + 8,
-                                fill="#0B1322", width=2, tags=(tag,))
-        self.cv.create_text(x + 24, y + 12, text=label, anchor="w",
-                            fill=_rgb((150, 167, 189)), font=self._f(9),
-                            tags=(tag,))
-        self.cv.tag_bind(tag, "<Button-1>", lambda e: cmd())
-
-    # -- DSH 同扁平风格（盖上面的夜航玻璃实现?---------------------------
-    DSH_BG = (27, 27, 28)        # #1B1B1C
-    DSH_CARD = (33, 33, 35)      # #212123
-    DSH_BORDER = (48, 49, 54)    # #303136
-    DSH_TEXT = (245, 245, 247)   # #F5F5F7
-    DSH_SUB = (160, 163, 168)    # #A0A3A8
-    DSH_MUTED = (120, 123, 128)  # #787B80
-    DSH_BTN = (67, 69, 74)       # #43454A
-    DSH_BTN_HOVER = (80, 82, 88)
-    DSH_TRACK = (46, 47, 51)
-
-    def render(self):
-        if getattr(self, "_entry", None):
-            return
+    def _empty(self, x1, y1, x2, y2):
+        c = self.c
         cv = self.cv
-        cv.delete("all")
-        self._btns = {}
-        W, H = self.LW, self.LH
-        cv.create_rectangle(0, 0, W, H, fill=_rgb(self.DSH_BG), outline="")
+        cv.create_image(x1, y1, anchor="nw",
+                        image=self._rr(x2 - x1, y2 - y1, 6, c["card"],
+                                       c["stroke"]))
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        self._ctext(cx, cy - 30, GLYPH["device"], c["dim"], self._fi(28))
+        self._ctext(cx, cy + 10, "没有设备", c["text"], self._f(12, True))
+        self._ctext(cx, cy + 34, "插入或重新拔插 2.4G 接收器即可添加",
+                    c["sub"], self._f(10))
 
-        snap = self.app.snapshot()
-        keys = list(snap.keys())
-        self._card_rects = {}
-        content = (len(keys) * 134 - 12) if keys else 122
-        self._max_scroll = max(0.0, content - 256.0)
-        self._scroll = max(0.0, min(self._scroll, self._max_scroll))
-        y = 88 - self._scroll
-        if keys:
-            for key in keys:
-                self._card(24, y, W - 24, y + 122, key)
-                y += 134
-        else:
-            self._empty_card(24, 88, W - 24, 210)
+    def _toggle(self, x, y, on):
+        c = self.c
+        W, H = self._px(40), self._px(20)
+        imgs = [self._image(("tog", W, H, on, hv),
+                            lambda hv=hv: toggle_png(W, H, self.S, on, hv, c))
+                for hv in (False, True)]
+        item = self.cv.create_image(x, y, anchor="nw", image=imgs[0],
+                                    tags=("tog",))
+        self.cv.tag_bind("tog", "<Button-1>", lambda e: self._toggle_startup())
+        self.cv.tag_bind("tog", "<Enter>", lambda e: self.cv.itemconfigure(
+            item, image=imgs[1]))
+        self.cv.tag_bind("tog", "<Leave>", lambda e: self.cv.itemconfigure(
+            item, image=imgs[0]))
 
-        # 裁剪视口：标题区与底栏用背景色盖住，边界各 1px，避免压掉卡片描边
-        cv.create_rectangle(0, 0, W, 87, fill=_rgb(self.DSH_BG), outline="")
-        cv.create_rectangle(0, 345, W, H, fill=_rgb(self.DSH_BG), outline="")
+    def _scrollbar(self):
+        if self._max_scroll <= 0:
+            return
+        top, bot = self._list
+        track = bot - top
+        content = self._max_scroll + track
+        th = max(24.0, track * track / content)
+        ty = top + (self._scroll / self._max_scroll) * (track - th)
+        self.cv.create_image(self.LW - 7, ty, anchor="nw",
+                             image=self._rr(3, th, 1.5, self.c["dim"]))
 
-        cv.create_text(30, 34, text="外设电量", anchor="w",
-                       fill=_rgb(self.DSH_TEXT), font=self._f(16, True))
-        iv = self.app.interval
-        iv_text = (f"每 {iv // 60} 分钟自动刷新" if iv % 60 == 0
-                   else f"每 {iv} 秒自动刷新")
-        cv.create_text(30, 56, text="2.4G 无线外设 · " + iv_text, anchor="w",
-                       fill=_rgb(self.DSH_SUB), font=self._f(9))
-        self._scrollbar()
-
-        upd = self._ctext(24, 372, self._updated_text(), _rgb(self.DSH_MUTED),
-                          self._f(9), anchor="w", tags=("upd_btn",))
-        cv.tag_bind("upd_btn", "<Button-1>", lambda e: self.app.refresh())
-        cv.tag_bind("upd_btn", "<Enter>",
-                    lambda e: cv.configure(cursor="hand2"))
-        cv.tag_bind("upd_btn", "<Leave>",
-                    lambda e: cv.configure(cursor=""))
-        self._check(380, 372, self._startup_var, "开机自启",
-                    lambda: self._toggle_startup())
-        self._button(472, 360, 64, 24, "最小化", self.hide, kind="ghost")
-        cv.scale("all", 0, 0, self.S, self.S)
-
-    def _draw_border(self):
-        """整圈 2px 边框：一条闭合折线 + 圆角连接，避免直线/圆弧接头。"""
-        cv = self.cv
-        W, H = self.W, self.H
-        R = 16.0 * self.S
-        col = _rgb((60, 60, 60))
-        pts = round_rect_points(2, 2, W - 2, H - 2, R - 2.0)
-        flat = [v for p in pts for v in p]
-        flat += flat[:2]
-        cv.create_line(*flat, fill=col, width=2,
-                       joinstyle="round", capstyle="round", smooth=False)
-
-    def open_help(self, key=None):
-        old = getattr(self, "_help_win", None)
-        if old is not None:
-            if getattr(old, "key", None) == key:
-                return
-            try:
-                old.close()
-            except Exception:
-                pass
-            self._help_win = None
-        self._help_win = HelpWindow(self, key)
+    # -- 交互 ----------------------------------------------------------------
+    def _refresh(self):
+        self.app.refresh()
+        self.render()
 
     def _on_wheel(self, e):
         if self._entry:
             self._commit_name(True)
         if self._max_scroll <= 0:
             return
-        self._scroll = max(0.0, min(self._max_scroll,
-                                    self._scroll + (-40 if e.delta > 0 else 40)))
+        step = -(self.CARD_H + self.GAP) if e.delta > 0 else (
+            self.CARD_H + self.GAP)
+        self._scroll = max(0.0, min(self._max_scroll, self._scroll + step))
         self.render()
 
-    def _sbar_press(self, e):
-        self._bar_drag = (e.y, self._scroll)
-
-    def _sbar_move(self, e):
-        if self._bar_drag is None or self._thumb_h <= 0:
+    def _on_right_click(self, e):
+        self._close_menu()
+        lx, ly = e.x / self.S, e.y / self.S
+        top, bot = getattr(self, "_list", (0, 0))
+        if not top <= ly <= bot:
             return
-        y0, s0 = self._bar_drag
-        travel = max(1.0, self._track_h - self._thumb_h)
-        dy = (e.y - y0) / self.S
-        self._scroll = max(0.0, min(self._max_scroll,
-                                    s0 + dy * (self._max_scroll / travel)))
+        for key, (x1, y1, x2, y2) in self._card_rects.items():
+            if x1 <= lx <= x2 and y1 <= ly <= y2:
+                r = self.app.snapshot().get(key)
+                tx = (x1 + 62) * self.S
+                ty = ((y1 + y2) / 2 - 10) * self.S
+                items = [(GLYPH["rename"], "重命名",
+                          lambda k=key: self._edit_name(k, tx, ty))]
+                if r is not None and r.status == "unknown_proto":
+                    items.append((GLYPH["settings"], "设置读取…",
+                                  lambda k=key: self.open_help(k)))
+                items.append((GLYPH["refresh"], "立即刷新", self._refresh))
+                items.append(None)
+                items.append((GLYPH["delete"], "删除设备",
+                              lambda k=key: self.delete_device(k)))
+                self._menu = FluentMenu(self, items, e.x_root, e.y_root)
+                return
+
+    def delete_device(self, key: str):
+        self._close_menu()
+        try:
+            self.app.remove_device(key)
+        except Exception:
+            pass
         self.render()
 
-    def _sbar_release(self, e):
-        self._bar_drag = None
+    def open_help(self, key=None):
+        old = self._help_win
+        if old is not None:
+            if getattr(old, "key", None) == key:
+                try:
+                    old.root.lift()
+                    old.root.focus_force()
+                except Exception:
+                    pass
+                return
+            self._close_help()
+        self._help_win = HelpWindow(self, key)
+        if not self.app.panel_only:
+            self._withdraw()
 
-    def _scrollbar(self):
-        if self._max_scroll <= 0:
-            self._track_h = self._thumb_h = 0.0
-            return
-        cv = self.cv
-        W = self.LW
-        x1, x2 = W - 14, W - 8
-        y1, y2 = 96, 336
-        track_h = y2 - y1
-        content = self._max_scroll + 256.0
-        thumb_h = max(24.0, track_h * 256.0 / content)
-        ty = y1 + (self._scroll / self._max_scroll) * (track_h - thumb_h)
-        self._track_h, self._thumb_h = track_h, thumb_h
-        draw_round_rect(cv, x1, y1, x2, y2, 3,
-                        fill=_rgb((42, 43, 46)), outline="")
-        bar = draw_round_rect(cv, x1, ty, x2, ty + thumb_h, 3,
-                              fill=_rgb((90, 93, 99)), outline="")
-        cv.addtag_withtag("sbar_thumb", bar)
-        cv.tag_bind("sbar_thumb", "<Button-1>", self._sbar_press)
-        cv.tag_bind("sbar_thumb", "<B1-Motion>", self._sbar_move)
-        cv.tag_bind("sbar_thumb", "<ButtonRelease-1>", self._sbar_release)
+    def _toggle_startup(self):
+        try:
+            if self._startup_var:
+                remove_startup()
+                self._startup_var = False
+            else:
+                self._startup_var = install_startup()
+            self.render()
+        except Exception as e:
+            self._modal = True
+            try:
+                messagebox.showerror("开机自启", f"设置失败：{e}",
+                                     parent=self.root)
+            finally:
+                self._modal = False
 
-    def _card(self, x1, y1, x2, y2, key):
-        cv = self.cv
-        self._card_rects[key] = (x1, y1, x2, y2)
-        r = (self.app.snapshot().get(key)
-             or Reading(ok=False, name="设备"))
-        draw_round_rect(cv, x1, y1, x2, y2, 12,
-                        fill=_rgb(self.DSH_CARD), outline=_rgb(self.DSH_BORDER),
-                        width=1)
-        nm_tag = f"nm_{key}"
-        cv.create_text(x1 + 18, y1 + 22, text=r.name or "设备", anchor="w",
-                       fill=_rgb(self.DSH_TEXT), font=self._f(12, True),
-                       tags=(nm_tag,))
-        cv.tag_bind(nm_tag, "<Double-Button-1>",
-                    lambda e, k=key, x=(x1 + 18) * self.S, y=(y1 + 22) * self.S:
-                    self._edit_name(k, x, y))
-        unknown = (r.status == "unknown_proto")
-        meta = f"{r.vid:04X}:{r.pid:04X}" if r.vid else "----:----"
-        hid = (f"0x{r.usage_page:04X}"
-               if (r.hid_known and r.usage_page) else "未知")
-        line = f"{meta} · HID ({hid})"
-        if r.stale:
-            cv.create_text(x1 + 18, y1 + 46,
-                           text=r.detail or "上次更新", anchor="w",
-                           fill=_rgb(self.DSH_SUB), font=self._f(9))
-        elif r.status == "asleep":
-            cv.create_text(x1 + 18, y1 + 46,
-                           text=r.detail or "设备休眠", anchor="w",
-                           fill=_rgb(self.DSH_SUB), font=self._f(9))
-        elif unknown:
-            text = f"{line}  协议未知，无法读取电量"
-            cv.create_text(x1 + 18, y1 + 46, text=text, anchor="w",
-                           fill=_rgb(self.DSH_SUB), font=self._f(9))
-            f9 = tkfont.Font(family=FONT, size=-int(round(9 * self.S)))
-            gap = f9.measure("汉") * 2 / self.S
-            bx = x1 + 18 + f9.measure(text) / self.S + gap
-            tag = f"fix_{key}"
-            cv.create_text(bx, y1 + 46, text="点我解决", anchor="w",
-                           fill=_rgb((90, 170, 240)), font=self._f(9, True),
-                           tags=(tag,))
-            wbtn = f9.measure("点我解决") / self.S
-            cv.create_line(bx, y1 + 51, bx + wbtn, y1 + 51,
-                           fill=_rgb((90, 170, 240)), width=1, tags=(tag,))
-            cv.tag_bind(tag, "<Button-1>",
-                        lambda e, k=key: self.open_help(k))
-            cv.tag_bind(tag, "<Enter>",
-                        lambda e: cv.configure(cursor="hand2"))
-            cv.tag_bind(tag, "<Leave>", lambda e: cv.configure(cursor=""))
-        else:
-            cv.create_text(x1 + 18, y1 + 46, text=line, anchor="w",
-                           fill=_rgb(self.DSH_SUB), font=self._f(9))
-        lv = r.level if r.ok else None
-        if r.ok and lv is not None:
-            cv.create_text(x2 - 44, y1 + 40, text=str(lv), anchor="e",
-                           fill=_rgb(self.DSH_TEXT), font=self._f(30, True))
-            cv.create_text(x2 - 24, y1 + 40, text="%", anchor="e",
-                           fill=_rgb(self.DSH_SUB), font=self._f(11))
-        elif r.status == "asleep":
-            cv.create_text(x2 - 24, y1 + 40, text="休眠", anchor="e",
-                           fill=_rgb(self.DSH_MUTED), font=self._f(14, True))
-        elif not unknown:
-            cv.create_text(x2 - 24, y1 + 40, text="未连接", anchor="e",
-                           fill=_rgb(self.DSH_MUTED), font=self._f(14, True))
-        bx1, bx2 = x1 + 18, x2 - 18
-        by = y2 - 24
-        draw_round_rect(cv, bx1, by, bx2, by + 6, 3,
-                        fill=_rgb(self.DSH_TRACK), outline="")
-        if lv is not None and lv > 0:
-            w = int((bx2 - bx1) * lv / 100)
-            draw_round_rect(cv, bx1, by, bx1 + max(6, w), by + 6, 3,
-                            fill=_rgb(self._level_rgb(lv)), outline="")
-
-    def _empty_card(self, x1, y1, x2, y2):
-        """没有任何 2.4G 接收器时的占位卡：只有提示和空电量槽?"""
-        cv = self.cv
-        draw_round_rect(cv, x1, y1, x2, y2, 12,
-                        fill=_rgb(self.DSH_CARD), outline=_rgb(self.DSH_BORDER),
-                        width=1)
-        cv.create_text(x1 + 18, y1 + 22, text="请插入设备", anchor="w",
-                       fill=_rgb(self.DSH_TEXT), font=self._f(12, True))
-        cv.create_text(x1 + 18, y1 + 46,
-                       text="或者拔插一下你想要添加的设备", anchor="w",
-                       fill=_rgb(self.DSH_SUB), font=self._f(9))
-        bx1, bx2 = x1 + 18, x2 - 18
-        by = y2 - 24
-        draw_round_rect(cv, bx1, by, bx2, by + 6, 3,
-                        fill=_rgb(self.DSH_TRACK), outline="")
-
+    # -- 改名 ----------------------------------------------------------------
     def _edit_name(self, key, x, y):
         if self._entry:
             self._commit_name(True)
@@ -4278,33 +4540,33 @@ class Panel:
         r = self.app.snapshot().get(key)
         current = (r.name if r and r.name else "")
         S = self.S
-        bar_len = self.W - 84 * S
-        limit_px = max(80, int(bar_len * 0.6))
-        font = tkfont.Font(family=FONT, size=-int(round(12 * S)),
-                           weight="bold")
+        c = self.c
+        limit_px = int((self.LW - 62 - 12 - 14 - 40 - 24) * S)
+        font = tkfont.Font(root=self.root, family=FONT,
+                           size=-int(round(11 * S)), weight="bold")
         cjk = max(1, font.measure("汉"))
         eng = max(1.0, font.measure("abcdefghij") / 10.0)
         avg = cjk * 0.4 + eng * 0.6
         self._name_font = font
         self._name_limit_px = limit_px
         self._name_max_chars = max(4, int(limit_px / max(1.0, avg)))
-        e = tk.Entry(self.root, bg="#212123", fg="#F5F5F7",
-                     insertbackground="#F5F5F7", relief="flat", bd=0,
-                     highlightthickness=1, highlightbackground="#3A3C41",
-                     highlightcolor="#5A5D63",
-                     font=(FONT, -int(round(12 * S)), "bold"),
-                     justify="left", selectbackground="#3A3D44",
-                     selectforeground="#F5F5F7")
+        e = tk.Entry(self.root, bg=_rgb(c["ctl"]), fg=_rgb(c["text"]),
+                     insertbackground=_rgb(c["text"]), relief="flat", bd=0,
+                     highlightthickness=max(1, int(S)),
+                     highlightbackground=_rgb(c["ctl_stroke"]),
+                     highlightcolor=_rgb(c["accent"]),
+                     font=(FONT, -int(round(11 * S)), "bold"),
+                     justify="left", selectbackground=_rgb(c["accent"]),
+                     selectforeground=_rgb(c["on_accent"]))
         e.insert(0, current)
-        e.select_range(0, "end")
         e.configure(validate="key",
                     validatecommand=(self.root.register(self._validate_name),
-                                    "%P"))
+                                     "%P"))
         self._entry = e
         self._entry_key = key
         self._entry_win = self.cv.create_window(
-            x, y, anchor="w", window=e, width=limit_px,
-            height=max(24, int(22 * S)))
+            x - 4 * S, y, anchor="w", window=e, width=limit_px + 8 * S,
+            height=max(24, int(26 * S)))
         self._entry_item = None
         ids = self.cv.find_withtag(f"nm_{key}")
         if ids:
@@ -4383,90 +4645,6 @@ class Panel:
         else:
             self.render()
 
-    def _ctext(self, x, y, text, fill, font, tags=(), anchor="center"):
-        """按文字实际包围盒做垂直光学居?"""
-        item = self.cv.create_text(x, y, text=text, fill=fill, font=font,
-                                   tags=tags, anchor=anchor)
-        try:
-            _x1, y1, _x2, y2 = self.cv.bbox(item)
-            dy = (y1 + y2) / 2.0 - y
-            if abs(dy) >= 0.5:
-                self.cv.move(item, 0, -dy)
-        except Exception:
-            pass
-        return item
-
-    def _button(self, x, y, w, h, text, cmd, kind="ghost"):
-        tag = f"btn_{text}_{x}"
-        if kind == "solid":
-            fill, border, col = self.DSH_BTN, self.DSH_BTN, self.DSH_TEXT
-            hover, hover_col = self.DSH_BTN_HOVER, self.DSH_TEXT
-        elif kind == "close":
-            # Windows 风格：正圆、透明底，悬停变红、图标变白
-            fill, border, col = self.DSH_BG, self.DSH_BG, self.DSH_SUB
-            hover, hover_col = (196, 43, 28), (255, 255, 255)
-        else:
-            fill, border, col = self.DSH_BG, self.DSH_BORDER, self.DSH_SUB
-            hover, hover_col = (42, 43, 46), self.DSH_SUB
-        radius = h / 2 if kind == "close" else 8
-        poly = draw_round_rect(self.cv, x, y, x + w, y + h, radius,
-                               fill=_rgb(fill), outline=_rgb(border),
-                               width=1, tags=(tag,))
-        txt = self._ctext(x + w / 2, y + h / 2, text, _rgb(col),
-                          self._f(11 if kind == "close" else 9), tags=(tag,))
-        self._btns[tag] = (poly, fill, hover, txt, col, hover_col, False)
-        self.cv.tag_bind(tag, "<Button-1>", lambda e: cmd())
-        self.cv.tag_bind(tag, "<Enter>", lambda e: self._hover_dsh(tag, True))
-        self.cv.tag_bind(tag, "<Leave>", lambda e: self._hover_dsh(tag, False))
-
-    def _hover_dsh(self, tag, on):
-        info = self._btns.get(tag)
-        if not info:
-            return
-        poly, base, hover, txt, col, hover_col, state = info
-        if state == on:
-            return
-        self._btns[tag] = (poly, base, hover, txt, col, hover_col, on)
-        self.cv.itemconfigure(poly, fill=_rgb(hover if on else base),
-                              outline=_rgb(hover if on else base))
-        self.cv.itemconfigure(txt, fill=_rgb(hover_col if on else col))
-
-    def _check(self, x, y, checked, label, cmd):
-        tag = f"chk_{label}"
-        if checked:
-            fill, border = self.DSH_BTN, self.DSH_BTN
-        else:
-            fill, border = self.DSH_BG, self.DSH_BORDER
-        # y 昕行的垂直丿；方框与文字同高?2px），不再向下突出
-        draw_round_rect(self.cv, x, y - 6, x + 12, y + 6, 3.5,
-                        fill=_rgb(fill), outline=_rgb(border), width=1,
-                        tags=(tag,))
-        if checked:
-            self.cv.create_line(x + 3, y + 1, x + 5.5, y + 3.5, x + 9.5, y - 3,
-                                fill=_rgb(self.DSH_TEXT), width=2, tags=(tag,))
-        self._ctext(x + 20, y, label, _rgb(self.DSH_SUB), self._f(9),
-                    tags=(tag,), anchor="w")
-        self.cv.tag_bind(tag, "<Button-1>", lambda e: cmd())
-
-    def _toggle_startup(self):
-        try:
-            if self._startup_var:
-                remove_startup()
-                self._startup_var = False
-            else:
-                self._startup_var = install_startup()
-            self.render()
-        except Exception as e:
-            messagebox.showerror("开机自启?", f"设置失败：{e}")
-
-    # 主线程轮诼把后台结果刷新到界面
-    def poll(self):
-        if getattr(self, "_dirty", False):
-            self._dirty = False
-            if self.root.winfo_viewable() and not self._entry:
-                self.render()
-        self.root.after(350, self.poll)
-
 
 # ===========================================================================
 # 托盘
@@ -4540,6 +4718,32 @@ shell32.Shell_NotifyIconW.restype = wt.BOOL
 user32.SetProcessDPIAware.argtypes = []
 user32.SetForegroundWindow.argtypes = [wt.HWND]
 user32.SetForegroundWindow.restype = wt.BOOL
+user32.CreatePopupMenu.restype = wt.HMENU
+user32.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_size_t, wt.LPCWSTR]
+user32.TrackPopupMenu.argtypes = [wt.HMENU, wt.UINT, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, wt.HWND,
+                                  ctypes.c_void_p]
+user32.TrackPopupMenu.restype = ctypes.c_int
+user32.DestroyMenu.argtypes = [wt.HMENU]
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
+MF_STRING = 0x0000
+MF_CHECKED = 0x0008
+MF_SEPARATOR = 0x0800
+TPM_RIGHTBUTTON = 0x0002
+TPM_RETURNCMD = 0x0100
+TRAY_OPEN, TRAY_REFRESH, TRAY_STARTUP, TRAY_QUIT = 1, 2, 3, 4
+
+
+def allow_dark_menus() -> None:
+    """让托盘右键菜单跟随系统深色（uxtheme 未公开序号 135/136）。"""
+    try:
+        ux = ctypes.WinDLL("uxtheme")
+        set_mode = ux[135]
+        set_mode.argtypes = [ctypes.c_int]
+        set_mode(1)  # AllowDark
+        ux[136]()    # FlushMenuThemes
+    except Exception:
+        pass
 
 
 class Tray:
@@ -4581,6 +4785,7 @@ class Tray:
                                            0, 0, 0, 0, None, None, hinst, None)
         if not self.hwnd:
             return
+        allow_dark_menus()
         self._add_icons()
         user32.SetTimer(self.hwnd, 1, max(30, self.app.interval) * 1000, None)
 
@@ -4686,13 +4891,39 @@ class Tray:
             user32.DestroyIcon(self._big_icon)
             self._big_icon = 0
 
+    def _context_menu(self, hwnd):
+        menu = user32.CreatePopupMenu()
+        if not menu:
+            return
+        try:
+            user32.AppendMenuW(menu, MF_STRING, TRAY_OPEN, "打开电量面板")
+            user32.AppendMenuW(menu, MF_STRING, TRAY_REFRESH, "立即刷新")
+            user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if
+                               startup_enabled() else 0),
+                               TRAY_STARTUP, "开机自启")
+            user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            user32.AppendMenuW(menu, MF_STRING, TRAY_QUIT, "退出")
+            pt = wt.POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            user32.SetForegroundWindow(hwnd)
+            cmd = user32.TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                                        pt.x, pt.y, 0, hwnd, None)
+            user32.PostMessageW(hwnd, 0, 0, 0)  # WM_NULL：让菜单正常收起
+        finally:
+            user32.DestroyMenu(menu)
+        if cmd:
+            self.app.tray_command(cmd)
+
     def _proc(self, hwnd, msg, wparam, lparam):
         if msg == WM_TRAYICON:
             cmd = lparam & 0xFFFF
-            if cmd == WM_RBUTTONUP:
-                self.app.request_show()
-            elif cmd == WM_LBUTTONUP:
-                self.app.refresh()
+            if cmd == WM_LBUTTONUP:
+                # 拿到前台权限，面板弹出后才能获得焦点（点外面自动收起）
+                user32.SetForegroundWindow(hwnd)
+                self.app.request_toggle()
+            elif cmd == WM_RBUTTONUP:
+                self._context_menu(hwnd)
             return 0
         if msg == WM_TIMER:
             self.app.refresh()
@@ -4758,6 +4989,8 @@ class TrayApp:
         self._add_win = None
         self._last_poll = 0.0
         self._hotplug_requested = False
+        self._toggle_requested = False
+        self._tray_cmds: "queue.SimpleQueue[int]" = queue.SimpleQueue()
 
     # -- 数据 --------------------------------------------------------------
     def snapshot(self) -> dict[str, Reading]:
@@ -4807,6 +5040,24 @@ class TrayApp:
     # -- 交互 --------------------------------------------------------------
     def request_show(self):
         self._show_requested = True
+
+    def request_toggle(self):
+        self._toggle_requested = True
+
+    def tray_command(self, cmd: int):
+        """托盘线程只投递命令，Tk 相关操作统一在主线程执行。"""
+        self._tray_cmds.put(cmd)
+
+    def _run_tray_command(self, cmd: int):
+        if cmd == TRAY_OPEN:
+            self.panel.show()
+            self.refresh()
+        elif cmd == TRAY_REFRESH:
+            self.refresh()
+        elif cmd == TRAY_STARTUP:
+            self.panel._toggle_startup()
+        elif cmd == TRAY_QUIT:
+            self.quit()
 
     def set_interval(self, sec) -> int:
         sec = clamp_interval(sec)
@@ -4860,16 +5111,9 @@ class TrayApp:
                                   ifaces)
             name = r.name or f"{vid:04X}:{pid:04X}"
             level = r.level if r.ok else None
-            msg = f"设备：{name}\nVID:PID：{vid:04X}:{pid:04X}"
-            if level is not None:
-                msg += f"\n当前电量：{level}%"
-            msg += "\n\n添加设备后，双击设备名可以改名\n\n是否添加？"
-            if messagebox.askyesno("发现新设备", msg,
-                                   parent=self.panel.root):
-                self.add_device(vid, pid, name)
+            self._add_win = AddDeviceWindow(self, vid, pid, name, level)
         except Exception:
-            pass
-        self._add_win = None
+            self._add_win = None
 
     def rename_device(self, key: str, name: str):
         for d in self.devices:
@@ -4911,7 +5155,8 @@ class TrayApp:
             user32.PostMessageW(self.tray.hwnd, WM_CLOSE, 0, 0)
         if self.panel:
             try:
-                self.panel.hide()
+                self.panel._close_help()
+                self.panel._withdraw()
             except Exception:
                 pass
         try:
@@ -4942,6 +5187,19 @@ class TrayApp:
             if self._show_requested:
                 self._show_requested = False
                 self.panel.show()
+            if self._toggle_requested:
+                self._toggle_requested = False
+                if self.panel.visible:
+                    self.panel.hide()
+                elif time.time() - self.panel._dismissed_at > 0.4:
+                    # 刚因点击托盘图标失焦收起的，这次点击就是“关”
+                    self.panel.show()
+                    self.refresh()
+            while not self._tray_cmds.empty():
+                try:
+                    self._run_tray_command(self._tray_cmds.get_nowait())
+                except Exception:
+                    pass
             if self._dirty:
                 self._dirty = False
                 if self.root.winfo_viewable():
@@ -4949,9 +5207,9 @@ class TrayApp:
             if self._stop:
                 self.root.quit()
                 return
-            self.root.after(250, tick)
+            self.root.after(50, tick)
 
-        self.root.after(250, tick)
+        self.root.after(50, tick)
         if self.panel_only:
             self.panel.show()
         self.root.mainloop()
