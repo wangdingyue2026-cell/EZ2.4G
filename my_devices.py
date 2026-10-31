@@ -2643,7 +2643,7 @@ def fluent_colors(light: bool) -> dict:
             "divider": (222, 222, 224),
             "card": (252, 252, 252), "card_hover": (246, 246, 247),
             "stroke": (228, 228, 230), "stroke_top": (236, 236, 238),
-            "stroke_bot": (212, 212, 215), "shadow": 0.09,
+            "stroke_bot": (212, 212, 215), "shadow": 0.06,
             "well": (238, 238, 240),
             "text": (26, 26, 26), "sub": (96, 96, 96), "dim": (138, 138, 138),
             "accent": accent, "accent_hover": _mix(accent, (255, 255, 255), 0.1),
