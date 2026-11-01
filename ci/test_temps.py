@@ -52,6 +52,25 @@ def case(fn):
 
 
 @case
+def same_gpu_listed_twice_is_merged():
+    """同一块显卡被枚举两次（PCI 地址相同）只显示一个；标签用厂商名。"""
+    nv = {"name": "NVIDIA GeForce RTX 4070", "pci": (1, 0, 0), "value": 52.0}
+    dup = dict(nv)
+    igpu = {"name": "Intel(R) UHD Graphics 770", "pci": (0, 2, 0),
+            "value": 45.0}
+    assert md.dedupe_gpus([nv, dup]) == [nv]
+    assert md.dedupe_gpus([nv, dup, igpu]) == [nv, igpu]
+    a = {"name": "GPU", "pci": None, "value": 60.0}
+    assert md.dedupe_gpus([a, dict(a)]) == [a]                # 没地址：名称 + 温度
+    b = dict(a, value=61.0)
+    assert len(md.dedupe_gpus([a, b])) == 2                   # 温度不同：两块卡
+    assert md.gpu_label(nv["name"], "GPU1") == "NVIDIA"
+    assert md.gpu_label(igpu["name"], "GPU2") == "Intel"
+    assert md.gpu_label("AMD Radeon RX 7800 XT", "GPU1") == "AMD"
+    assert md.gpu_label("Some Adapter", "GPU2") == "GPU2"
+
+
+@case
 def pick_intel_package_and_nvidia_core():
     cpu, gpus = md._pick_lhm([
         {"Name": "CPU Core #1", "Parent": "/intelcpu/0", "Value": 61.0},

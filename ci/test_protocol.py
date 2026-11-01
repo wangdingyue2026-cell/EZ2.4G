@@ -480,6 +480,57 @@ def logitech_hidpp_unified_battery():
 
 
 @case
+def logitech_g703_voltage_only():
+    """G703 这类老款只有 0x1001：按 Solaar 的锂电曲线把毫伏换算成百分比。"""
+    assert md.logitech_mv_percent(4200) == 100
+    assert md.logitech_mv_percent(3500) == 0
+    assert md.logitech_mv_percent(3811) == 50
+    assert md.logitech_mv_percent(3795) == 45            # 3778→40 与 3811→50 之间
+    ping = pad(H("11 01 00 1E 04 02 5A"), 20)
+    none = pad(H("11 01 00 0E 00"), 20)
+    v1001 = pad(H("11 01 00 0E 05"), 20)
+    volt = pad(H("11 01 05 0E 0E D3 00"), 20)            # 0x0ED3 = 3795 mV，放电
+    SCRIPTS["g703"] = {"input": [ping, none, none, v1001, volt]}
+    ifs = [hid("g703", 0x046D, 0xC539, 0xFF00, 20, 20, usage=2,
+               product="USB Receiver")]
+    r = md.adapters_for(ifs)[0].read(ifs)
+    assert r.ok and r.level == 45 and r.status == "discharging", r
+    assert "3795 mV" in r.detail, r.detail
+    chg = pad(H("11 01 05 0E 10 2C 81"), 20)             # 4140 mV，充电中、已充满
+    SCRIPTS["g703b"] = {"input": [ping, none, none, v1001, chg]}
+    ifs[0] = md.dataclasses.replace(ifs[0], path="g703b")
+    r = md.adapters_for(ifs)[0].read(ifs)
+    assert r.ok and r.status == "full", r
+
+
+@case
+def non_battery_devices_from_user_report():
+    """用户贴来的 4 台设备：主板灯效、动态光效虚拟设备、只有标准键鼠接口的接收器，
+    都判为“不提供电量”，插上不弹窗、添加列表不列。"""
+    def iface(path, vid, pid, page, usage, inp, out, feat):
+        return md.HidIface(path, vid, pid, page, usage, inp, out, feat)
+    telink = [iface("t1", 0x248A, 0x8379, 0x000C, 1, 3, 0, 0),
+              iface("t2", 0x248A, 0x8379, 0x0001, 0x80, 2, 0, 0),
+              iface("t3", 0x248A, 0x8379, 0x0001, 6, 9, 2, 0),
+              iface("t4", 0x248A, 0x8379, 0x0001, 2, 8, 0, 0)]
+    colorful = [iface("c1", 0x2F4C, 0x1017, 0xFF00, 1, 65, 65, 65),
+                iface("c2", 0x2F4C, 0x1017, 0x0059, 1, 0, 0, 51),
+                iface("c3", 0x2F4C, 0x1017, 0xFF01, 1, 65, 65, 9)]
+    vhf = [iface("v1", 0x046D, 0x4086, 0x0059, 1, 2, 0, 51)]
+    kbd = [iface("k1", 0x046D, 0xC232, 0x0001, 6, 9, 2, 0)]
+    for cand in (telink, colorful, vhf, kbd):
+        assert not md.battery_channel_possible(cand), cand[0]
+        assert not md.worth_offering(cand), cand[0]
+    atk = [hid("a", 0x373B, 0x9999, 0xFF02, 17, 17)]
+    assert md.battery_channel_possible(atk)
+    store = {}
+    memory_config(store)
+    md.read_standard_battery = lambda d: None
+    r = md.read_saved_device({"vid": 0x248A, "pid": 0x8379, "name": ""}, telink)
+    assert r.status == "no_battery", r
+
+
+@case
 def razer_scales_raw_and_reads_charging():
     """雷蛇电量 0–255 一律换算（132 → 52%），充电走 0x84。"""
     def reply(tx, val):

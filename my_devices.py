@@ -825,6 +825,11 @@ class D3DKMT_ADAPTER_PERFDATA(ctypes.Structure):
                 ("PowerStateOverride", ctypes.c_ubyte)]
 
 
+class D3DKMT_ADAPTERADDRESS(ctypes.Structure):
+    _fields_ = [("BusNumber", wt.UINT), ("DeviceNumber", wt.UINT),
+                ("FunctionNumber", wt.UINT)]
+
+
 class D3DKMT_ADAPTERREGISTRYINFO(ctypes.Structure):
     _fields_ = [("AdapterString", wt.WCHAR * 260),
                 ("BiosString", wt.WCHAR * 260),
@@ -859,6 +864,7 @@ class PROCESSENTRY32W(ctypes.Structure):
                 ("szExeFile", wt.WCHAR * 260)]
 
 
+KMTQAITYPE_ADAPTERADDRESS = 6
 KMTQAITYPE_ADAPTERREGISTRYINFO = 8
 KMTQAITYPE_ADAPTERPERFDATA = 62
 PDH_FMT_DOUBLE = 0x00000200
@@ -911,11 +917,43 @@ def gpu_temperatures() -> list:
                 ctypes.cast(ctypes.byref(reg), ctypes.c_void_p),
                 ctypes.sizeof(reg))
             name = reg.AdapterString if query(ctypes.byref(q)) == 0 else ""
-            out.append({"name": name or "GPU",
+            addr = D3DKMT_ADAPTERADDRESS()
+            q = D3DKMT_QUERYADAPTERINFO(
+                a.hAdapter, KMTQAITYPE_ADAPTERADDRESS,
+                ctypes.cast(ctypes.byref(addr), ctypes.c_void_p),
+                ctypes.sizeof(addr))
+            pci = ((addr.BusNumber, addr.DeviceNumber, addr.FunctionNumber)
+                   if query(ctypes.byref(q)) == 0 else None)
+            out.append({"name": name or "GPU", "pci": pci,
                         "value": perf.Temperature / 10.0})
         finally:
             close(ctypes.byref(D3DKMT_CLOSEADAPTER(a.hAdapter)))
+    return dedupe_gpus(out)
+
+
+def dedupe_gpus(gpus: list) -> list:
+    """同一块物理显卡可能被枚举两次（渲染 / 显示两种身份、远程桌面或虚拟显示器的
+    影子适配器），温度完全一样。按 PCI 地址去重；拿不到地址时按“名称 + 温度”去重。"""
+    out, seen = [], set()
+    for g in gpus:
+        key = (("pci",) + tuple(g["pci"]) if g.get("pci")
+               else ("name", g.get("name"), g.get("value")))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(g)
     return out
+
+
+def gpu_label(name: str, fallback: str) -> str:
+    """温度格上的显卡标签：取厂商名（NVIDIA / AMD / Intel），认不出就用 GPU1 这类编号。"""
+    n = (name or "").lower()
+    for word, label in (("nvidia", "NVIDIA"), ("geforce", "NVIDIA"),
+                        ("radeon", "AMD"), ("amd", "AMD"), ("intel", "Intel"),
+                        ("arc", "Intel")):
+        if word in n:
+            return label
+    return fallback
 
 
 def _cpu_thermal_zone() -> Optional[float]:
@@ -1177,13 +1215,15 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
     src = (adapter and f"{adapter.brand} 协议") or protocol_source(proto)
     if r is None or not r.ok:
         err = ar.detail if (ar is not None and ar.status != "asleep") else ""
-        r = Reading(
-            ok=False, present=True, name=name,
-            status=("error" if err else "asleep") if supported
-            else "unknown_proto",
-            source=src if supported else "",
-            detail=err or ("设备休眠" if supported
-                           else "协议未知，无法读取电量"))
+        if supported:
+            status, detail = ("error" if err else "asleep"), \
+                err or "设备休眠"
+        elif not battery_channel_possible(cand):
+            status, detail = "no_battery", "这个设备不向电脑提供电量信息"
+        else:
+            status, detail = "unknown_proto", "协议未知，无法读取电量"
+        r = Reading(ok=False, present=True, name=name, status=status,
+                    source=src if supported else "", detail=detail)
     r.name = name
     r.present = True
     meta = next((d for d in cand if d.usage_page >= 0xFF00), cand[0])
@@ -1231,7 +1271,8 @@ def apply_last_known(res: dict[str, Reading]) -> dict[str, Reading]:
             out[key] = r
             continue
         if ((not r.ok) and key in last
-                and r.status not in ("unknown_proto", "unplugged")):
+                and r.status not in ("unknown_proto", "unplugged",
+                                     "no_battery")):
             item = last[key]
             try:
                 level = int(item.get("level"))
@@ -2141,11 +2182,29 @@ class SpecAdapter(Adapter):
         return None, b""
 
 
+# 锂电池电压 → 电量（Solaar 的对照表，段内线性插值）
+LOGI_MV_CURVE = ((4186, 100), (4067, 90), (3989, 80), (3922, 70), (3859, 60),
+                 (3811, 50), (3778, 40), (3751, 30), (3717, 20), (3671, 10),
+                 (3646, 5), (3579, 2), (3500, 0))
+
+
+def logitech_mv_percent(mv: int) -> int:
+    if mv >= LOGI_MV_CURVE[0][0]:
+        return 100
+    if mv <= LOGI_MV_CURVE[-1][0]:
+        return 0
+    for (vh, ph), (vl, pl) in zip(LOGI_MV_CURVE, LOGI_MV_CURVE[1:]):
+        if vl <= mv <= vh:
+            return round(pl + (ph - pl) * (mv - vl) / (vh - vl))
+    return 0
+
+
 class LogitechAdapter(Adapter):
     """罗技 LIGHTSPEED / Unifying / Bolt 接收器，HID++ 2.0。
 
     先 ping 1..4 号设备位找到鼠标（记住），再查 0x1000 BATTERY_STATUS（老款直接给百分比），
-    没有就查 0x1004 UNIFIED_BATTERY 的功能 1 get_status。0x1004 的功能 0 是能力描述，
+    没有就查 0x1004 UNIFIED_BATTERY 的功能 1 get_status，再没有就查 0x1001 BATTERY_VOLTAGE
+    （G703 / G903 等只给毫伏，按 Solaar 的锂电曲线估算百分比）。0x1004 的功能 0 是能力描述，
     别读（Voltide：读错会让 G HUB 跟着显示错电量）。软件 ID 用 0xE，避开 G HUB 的 0xD。
     充电状态字节按 Solaar 的定义解析。"""
     id = "logitech"
@@ -2233,12 +2292,18 @@ class LogitechAdapter(Adapter):
             if idx is None:
                 return self._asleep()
             feat, answered = self._feature(dev, idx, 0x1000)
-            fn = 0x00
+            fn, fid = 0x00, 0x1000
             if not feat:
                 if not answered:
                     return self._asleep()
                 feat, answered = self._feature(dev, idx, 0x1004)
-                fn = 0x01
+                fn, fid = 0x01, 0x1004
+            if not feat:
+                if not answered:
+                    return self._asleep()
+                # G703 / G903 / G PRO Wireless 等老款只给电压（0x1001）
+                feat, answered = self._feature(dev, idx, 0x1001)
+                fn, fid = 0x00, 0x1001
                 if not feat:
                     return (self._asleep() if not answered else
                             Reading(ok=False, source="罗技协议",
@@ -2246,6 +2311,16 @@ class LogitechAdapter(Adapter):
             p = self._call(dev, idx, feat, fn)
             if not p:
                 return self._asleep()
+            if fid == 0x1001:
+                mv, flags = p[4] << 8 | p[5], p[6]
+                if not 2500 <= mv <= 5000:
+                    return Reading(ok=False, source="罗技协议",
+                                   detail="读数异常", raw=bytes(p))
+                status = "discharging"
+                if flags & 0x80:        # 充电中；低两位 1 = 已充满
+                    status = "full" if flags & 0x03 == 1 else "charging"
+                return self._ok(logitech_mv_percent(mv), status,
+                                f"按电压估算 · {mv} mV", bytes(p))
             level, state = p[4], p[6]
             if level > 100:
                 return Reading(ok=False, source="罗技协议", detail="读数异常",
@@ -2763,6 +2838,32 @@ def device_info_text(r: "Reading", ifaces=None) -> str:
     return "\n".join(lines)
 
 
+def battery_channel_possible(cand: list) -> bool:
+    """这台设备有没有可能被问到电量（不看适配器，只看接口）。
+
+    灯效设备（只有 0x0059 Lighting 接口、没有鼠标键盘接口，如主板灯效控制器、
+    Windows 动态光效的虚拟设备）不算；既没有厂商自定义接口、也没有 Feature 报告的
+    设备（如只有标准键鼠接口的廉价接收器）电脑无从询问，也不算。"""
+    pages = {d.usage_page for d in cand}
+    input_dev = any(d.usage_page == 0x0001 and d.usage in (2, 4, 5, 6)
+                    for d in cand)
+    if 0x0059 in pages and not input_dev:
+        return False
+    return any(d.usage_page >= 0xFF00 or d.feature_len > 0 for d in cand)
+
+
+def worth_offering(cand: list) -> bool:
+    """插拔弹窗 / 添加列表要不要列出它：能读电量，或至少可能读到。"""
+    if not cand:
+        return False
+    vid, pid = cand[0].vid, cand[0].pid
+    if adapters_for(cand) or f"{vid:04X}:{pid:04X}" in user_protocols():
+        return True
+    if cand[0].instance.upper().startswith(("BTHENUM", "BTHLE")):
+        return False
+    return battery_channel_possible(cand)
+
+
 def addable_devices(ifaces: list, devices: list) -> list:
     """「添加设备」窗口的候选：插着、还没在面板里的接收器。
 
@@ -2781,7 +2882,7 @@ def addable_devices(ifaces: list, devices: list) -> list:
             continue
         found = adapters_for(cand)
         supported = bool(found) or f"{vid:04X}:{pid:04X}" in saved
-        if not supported and not any(d.usage_page >= 0xFF00 for d in cand):
+        if not supported and not battery_channel_possible(cand):
             continue
         prod = next((d.product for d in cand if d.product), "")
         name = (found[0].model_name(cand) if found
@@ -4187,6 +4288,60 @@ def ring_png(size: int, thick: float, level: Optional[int], color, track,
         px[i + 1] = min(255, int((col[1] * pc + track[1] * q) / a + 0.5))
         px[i + 2] = min(255, int((col[2] * pc + track[2] * q) / a + 0.5))
         px[i + 3] = int(a * 255 + 0.5)
+    return _png_b64(size, size, px)
+
+
+def refresh_png(size: int, color, angle: float) -> str:
+    """刷新图标（约 300° 圆弧 + 箭头），按 angle 度顺时针旋转。
+    用图片帧代替旋转字体图标：Tk 旋转文字绕的是文字框中心而不是笔画中心，
+    还会按像素对齐，转起来会晃。4×4 超采样抗锯齿。"""
+    c = size / 2.0
+    r = size * 0.34
+    hw = size * 0.055
+    th0, th1 = math.radians(75), math.radians(360)
+    a = math.radians(angle)
+    ca, sa = math.cos(a), math.sin(a)
+    # 箭头：在圆弧末端（正上方）沿顺时针切线方向
+    bx, by = c + r * math.sin(th1), c - r * math.cos(th1)
+    tx, ty = math.cos(th1), math.sin(th1)
+    nx, ny = math.sin(th1), -math.cos(th1)
+    h, w = size * 0.20, size * 0.16
+    tri = ((bx + tx * h, by + ty * h), (bx + nx * w, by + ny * w),
+           (bx - nx * w, by - ny * w))
+    sx0, sy0 = c + r * math.sin(th0), c - r * math.cos(th0)
+
+    def side(p, q, x, y):
+        return (q[0] - p[0]) * (y - p[1]) - (q[1] - p[1]) * (x - p[0])
+
+    def inside(x, y):
+        d = math.hypot(x - c, y - c)
+        if abs(d - r) <= hw:
+            th = math.atan2(x - c, -(y - c)) % (2 * math.pi)
+            if th0 <= th <= th1:
+                return True
+        if math.hypot(x - sx0, y - sy0) <= hw:
+            return True
+        s1 = side(tri[0], tri[1], x, y)
+        s2 = side(tri[1], tri[2], x, y)
+        s3 = side(tri[2], tri[0], x, y)
+        return (s1 >= 0 and s2 >= 0 and s3 >= 0) or \
+            (s1 <= 0 and s2 <= 0 and s3 <= 0)
+
+    px = bytearray(size * size * 4)
+    for y in range(size):
+        for x in range(size):
+            hit = 0
+            for j in range(4):
+                for i in range(4):
+                    fx = x + (i + 0.5) / 4 - c
+                    fy = y + (j + 0.5) / 4 - c
+                    # 反向旋转采样点
+                    if inside(c + fx * ca + fy * sa, c - fx * sa + fy * ca):
+                        hit += 1
+            if hit:
+                k = (y * size + x) * 4
+                px[k], px[k + 1], px[k + 2] = color
+                px[k + 3] = int(hit / 16 * 255 + 0.5)
     return _png_b64(size, size, px)
 
 
@@ -5728,6 +5883,8 @@ class Panel(_Fluent):
         self._bob = None
         self._spin_angle = 0.0
         self._spin_until = 0.0
+        self._spin_item = None
+        self._spin_frame = -1
         self._ambient_on = False
         self._visible = False
         self._closing = False
@@ -5768,6 +5925,7 @@ class Panel(_Fluent):
                   for lv in range(0, 101)]
         specs += [self._spec_toggle(f, hv) for f in range(7)
                   for hv in (False, True)]
+        specs += [self._spec_refresh(f) for f in range(36)]
         todo = [s for s in specs if s[0] not in _B64]
 
         def work():
@@ -5777,6 +5935,14 @@ class Panel(_Fluent):
                 except Exception:
                     pass
         threading.Thread(target=work, daemon=True).start()
+
+    def _spec_refresh(self, frame):
+        D, col = self._px(16), self.c["sub"]
+        return (("refresh", D, col, frame),
+                lambda: refresh_png(D, col, frame * 10))
+
+    def _refresh_img(self, frame):
+        return self._img(self._spec_refresh(frame))
 
     def _spec_card(self, k):
         c = self.c
@@ -6077,8 +6243,12 @@ class Panel(_Fluent):
             self._button(bx, 13, 32, 32, GLYPH["close"], self.hide,
                          kind="subtle", tag="btn_close", glyph=True, size=11)
             bx -= 36
-        self._button(bx, 13, 32, 32, GLYPH["refresh"], self._refresh,
+        self._button(bx, 13, 32, 32, "", self._refresh,
                      kind="subtle", tag="btn_refresh", glyph=True, size=13)
+        self._spin_item = cv.create_image(
+            bx + 16, 29, tags=("btn_refresh",),
+            image=self._refresh_img(int(round(self._spin_angle / 10)) % 36))
+        self._spin_frame = -1
         if n or self._editing:
             bx -= 36
             self._button(bx, 13, 32, 32,
@@ -6119,8 +6289,13 @@ class Panel(_Fluent):
         chips = [("CPU", t.get("cpu"))]
         gpus = (t.get("gpus") or [])[:2]
         if gpus:
-            for i, g in enumerate(gpus):
-                chips.append(("GPU" if len(gpus) == 1 else f"GPU{i + 1}", g))
+            labels = [gpu_label(g.get("name", ""), f"GPU{i + 1}")
+                      for i, g in enumerate(gpus)]
+            if len(gpus) == 1 or len(set(labels)) < len(labels):
+                labels = (["GPU"] if len(gpus) == 1 else
+                          [f"GPU{i + 1}" for i in range(len(gpus))])
+            for label, g in zip(labels, gpus):
+                chips.append((label, g))
         else:
             chips.append(("GPU", None))
         return chips, bool(t)
@@ -6222,6 +6397,8 @@ class Panel(_Fluent):
             return "手柄 · " + (r.detail or "XInput"), False
         if r.status == "unknown_proto":
             return "协议未知", True
+        if r.status == "no_battery":
+            return "不提供电量信息", False
         if r.stale:
             return r.detail or "上次读数", False
         if r.status == "asleep":
@@ -6448,7 +6625,6 @@ class Panel(_Fluent):
             return
         cv = self.cv
         now = time.perf_counter()
-        info = self._btns.get("btn_refresh")
         spinning = self.app._refreshing or now < self._spin_until
         if spinning:
             self._spin_angle = (self._spin_angle + 10) % 360
@@ -6456,9 +6632,12 @@ class Panel(_Fluent):
             self._spin_angle = self._spin_angle + 10
             if self._spin_angle >= 360:
                 self._spin_angle = 0.0
-        if info:
+        frame = int(round(self._spin_angle / 10)) % 36
+        if self._spin_item and frame != self._spin_frame:
+            self._spin_frame = frame
             try:
-                cv.itemconfigure(info[2], angle=-self._spin_angle)
+                cv.itemconfigure(self._spin_item,
+                                 image=self._refresh_img(frame))
             except tk.TclError:
                 pass
         if self._bob:
@@ -7358,6 +7537,9 @@ class TrayApp:
             if any(d["vid"] == vid and d["pid"] == pid
                    for d in self.devices):
                 continue
+            if not worth_offering([d for d in ifaces
+                                   if d.vid == vid and d.pid == pid]):
+                continue    # 主板灯效、虚拟设备、读不了电量的接收器：不打扰
             self._asked.add((vid, pid))
             self._pending_add = (vid, pid)
             break
