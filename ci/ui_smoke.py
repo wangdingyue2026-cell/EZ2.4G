@@ -134,6 +134,8 @@ for light in (False, True):
             pump(p.root, 0.3)
             if not p._btns.get("btn_del_a"):
                 errors.append("edit mode shows no delete button on card a")
+            if not p._btns.get("btn_ren_a"):
+                errors.append("edit mode shows no rename button on card a")
             grab(p.root, f"edit_{tag}")
             p._toggle_edit()
             pump(p.root, 0.2)

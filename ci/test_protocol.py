@@ -618,6 +618,24 @@ def addable_devices_for_picker():
     assert got[2]["name"] == "Zeta Receiver"
 
 
+@case
+def device_art_and_kind():
+    """内嵌的 3D 图标能解码、缩放；设备类型优先用适配器认定的。"""
+    for kind in ("mouse", "keyboard", "headset", "gamepad", "device",
+                 "bluetooth"):
+        b64 = md.device_art_png(kind, 40)
+        assert b64, kind
+        w, h, px = md._png_rgba(md.base64.b64decode(b64))
+        assert (w, h) == (40, 40) and any(px[3::4]), kind
+    assert md.device_kind("ATK A9 Air 大师+", "device", "mouse") == "mouse"
+    assert md.device_kind("MCHOSE V9 Turbo 耳机") == "headset"
+    assert md.device_kind("Wireless Receiver") == "device"
+    store = {}
+    memory_config(store)
+    got = md.addable_devices([hid("a", 0x373B, 0x1278, 0xFF02, 17, 17)], [])
+    assert got[0]["kind"] == "mouse", got
+
+
 # -- 导入设备规格（声明式适配器，带真机样本） ----------------------------------------
 GOOD_SPEC = {"name": "示例 鼠标", "kind": "mouse", "ids": [["ABCD", "0001"]],
              "page": "0xFF02", "lens": {"in": 17, "out": 17},
