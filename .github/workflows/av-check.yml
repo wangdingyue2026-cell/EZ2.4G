@@ -1,0 +1,67 @@
+name: Antivirus check
+
+# 手动触发：用不同方式打包，分别用 Windows Defender 扫描，对比哪种不会被误报。
+on:
+  workflow_dispatch:
+  push:
+    branches: [av-fix]
+
+jobs:
+  scan:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Defender status and signature update
+        shell: pwsh
+        run: |
+          Get-MpComputerStatus | Select-Object AMServiceEnabled, AntivirusEnabled, AntivirusSignatureVersion, AntivirusSignatureLastUpdated | Format-List
+          & "$env:ProgramFiles\Windows Defender\MpCmdRun.exe" -SignatureUpdate
+          Get-MpComputerStatus | Select-Object AntivirusSignatureVersion, AntivirusSignatureLastUpdated | Format-List
+
+      - name: "A: current build (pip wheel bootloader, onefile)"
+        shell: pwsh
+        run: |
+          python -m venv va
+          va\Scripts\python -m pip install -q pyinstaller==6.11.1
+          va\Scripts\pyinstaller --noconfirm --onefile --windowed --name 2.4G --icon app.ico --distpath outA --workpath buildA my_devices.py
+
+      - name: "B: bootloader compiled from source + version info, onefile"
+        shell: pwsh
+        env:
+          PYINSTALLER_COMPILE_BOOTLOADER: "1"
+        run: |
+          python -m venv vb
+          vb\Scripts\python -m pip install -q --no-binary pyinstaller pyinstaller==6.11.1
+          vb\Scripts\pyinstaller --noconfirm --onefile --windowed --name 2.4G --icon app.ico --version-file ci\version_info.txt --distpath outB --workpath buildB my_devices.py
+
+      - name: "C: same as B but onedir"
+        shell: pwsh
+        run: |
+          vb\Scripts\pyinstaller --noconfirm --onedir --windowed --name 2.4G --icon app.ico --version-file ci\version_info.txt --distpath outC --workpath buildC my_devices.py
+
+      - name: Scan each build with Defender
+        shell: pwsh
+        run: |
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          foreach ($target in @("outA\2.4G.exe", "outB\2.4G.exe", "outC\2.4G")) {
+            $full = (Resolve-Path $target).Path
+            Write-Host "===== $target"
+            & $mp -Scan -ScanType 3 -File $full -DisableRemediation | Out-String | Write-Host
+            Write-Host "exit code: $LASTEXITCODE  (0 = clean, 2 = threat found)"
+          }
+          Write-Host "===== detections"
+          Get-MpThreatDetection | Select-Object ThreatID, Resources, InitialDetectionTime | Format-List
+          Get-MpThreat | Select-Object ThreatID, ThreatName | Format-List
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: av-builds
+          path: |
+            outA/2.4G.exe
+            outB/2.4G.exe
