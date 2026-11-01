@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-外设电量 —?Windows 10/11 无线外设电量托盘工具
+外设电量 — Windows 10/11 无线外设电量托盘工具
 
 纯标准库 + ctypes + tkinter，零第三方依赖。
 
 用法：
-    python my_devices.py              # 托盘 + 电量面板
-    python my_devices.py --once       # 读一次并打印
-    python my_devices.py --list       # 列出的 HID 接口
-    python my_devices.py --panel      # 只开面板（不常驻托盘）
-    python my_devices.py --install    # 创建开机自启 + 桌面入口
+    python my_devices.py                   # 托盘 + 电量面板
+    python my_devices.py --once            # 读一次并打印
+    python my_devices.py --list            # 列出所有 HID 接口
+    python my_devices.py --panel           # 只开面板（不常驻托盘）
+    python my_devices.py --install         # 创建开机自启 + 桌面入口
+    python my_devices.py --import 文件.json  # 导入别人分享的协议（并添加设备）
+    python my_devices.py --export 文件.json  # 导出已保存的协议，分享给同款设备用户
 """
 from __future__ import annotations
 
@@ -1062,8 +1064,8 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
     prod = next((d.product for d in cand if d.product), "")
     if not name:
         name = prod or f"{vid:04X}:{pid:04X}"
-    # 只允许两条路：标准 HID 直接读，或抓包保存的协议。
-    # 不再做厂商兼容试探，也不再按 VID/PID 匹配内置设备。
+    # 三条路：标准 HID 直接读、已保存的协议（抓包 / 导入 / 内置），
+    # 都没有时按 VID + 厂商接口试一次内置厂商协议，读到才保存。
     r = None
     for d in cand:
         try:
@@ -1083,6 +1085,12 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
                     r = rr
             except Exception:
                 pass
+        elif proto is None:
+            rr, preset = read_vendor_preset(vid, cand)
+            if rr is not None:
+                r = rr
+                save_user_protocol(vid, pid, preset, kind="preset")
+                proto = user_protocols().get(key)
     elif proto is None:
         # 标准 HID 能直接读：保存成协议，之后休眠也算“有协议”
         save_standard_protocol(vid, pid)
@@ -1091,13 +1099,12 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
         r = Reading(
             ok=False, present=True, name=name,
             status="asleep" if supported else "unknown_proto",
+            source=protocol_source(proto) if supported else "",
             detail=("设备休眠" if supported
                     else "协议未知，无法读取电量"))
     elif not r.ok and supported:
         r.status = "asleep"
-        r.source = ("标准 HID 电量"
-                    if proto is not None and proto.get("kind") == "standard"
-                    else "抓包协议")
+        r.source = protocol_source(proto)
         r.detail = "设备休眠"
     r.name = name
     r.present = True
@@ -1678,15 +1685,20 @@ def user_protocols() -> dict:
 
 
 PROTO_KEYS = ("invert", "requests", "offset", "v", "req_kinds", "out_len",
-              "reply", "reply_id", "in_len", "match")
+              "reply", "reply_id", "in_len", "match",
+              # 内置协议 / 导入协议额外用到的字段
+              "name", "usage_page", "tries", "wait_ms", "timeout_ms",
+              "strict", "scale", "level_max", "source")
+PROTO_KINDS = ("standard", "captured", "preset")
 
 
-def save_user_protocol(vid: int, pid: int, proto: dict) -> None:
+def save_user_protocol(vid: int, pid: int, proto: dict,
+                       kind: str = "captured") -> None:
     cfg = load_config()
     protos = cfg.get("protocols")
     if not isinstance(protos, dict):
         protos = {}
-    saved = {"kind": "captured"}
+    saved = {"kind": kind}
     for k in PROTO_KEYS:
         if k in proto:
             saved[k] = proto[k]
@@ -1696,6 +1708,239 @@ def save_user_protocol(vid: int, pid: int, proto: dict) -> None:
     protos[f"{vid:04X}:{pid:04X}"] = saved
     cfg["protocols"] = protos
     save_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# 内置厂商协议：按 VID + 厂商接口（usage page）识别，读到电量后才保存为该设备的协议。
+# 来源：yszyszysz233/2.4G-battery-viewer 的厂商协议表（ATK 协议 2、DARKRIM 已真机验证，
+# 其余来自公开协议文档）。偏移都从 Windows 缓冲区第 0 字节（报告 ID）算起。
+# ---------------------------------------------------------------------------
+def _jl_query(tlv: int) -> str:
+    """杰理 JL_RCSP 查询帧（序号 0、TLV 长度 0），CRC16-CCITT-FALSE 大端。"""
+    f = bytearray((0x00, 0xFE, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00, 0x02, 0x00,
+                   tlv, 0x00))
+    crc = 0xFFFF
+    for b in f[1:]:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if crc & 0x8000 else crc << 1
+            crc &= 0xFFFF
+    f += bytes((crc >> 8, crc & 0xFF))
+    return " ".join(f"{b:02X}" for b in f)
+
+
+_ATK_V1 = "08 04" + " 00" * 15 + " 49"
+
+VENDOR_PRESETS = [
+    {"name": "ATK / VXE 无线鼠标", "vid": 0x373B, "usage_page": 0xFF05,
+     "requests": ["08 7D 72 02 00 01 07 01"], "req_kinds": ["out"],
+     "out_len": 64, "reply": "input", "in_len": 64, "offset": 7,
+     "match": [[0, 0x08], [1, 0x72], [5, 0x07]]},
+    {"name": "ATK / VXE / VGN 无线鼠标", "vid": 0x373B, "usage_page": 0xFF02,
+     "requests": [_ATK_V1], "req_kinds": ["out"], "out_len": 17,
+     "reply": "input", "in_len": 17, "offset": 6, "match": [[0, 0x08]]},
+    {"name": "VXE / VGN 无线鼠标", "vid": 0x3554, "usage_page": 0xFF02,
+     "requests": [_ATK_V1], "req_kinds": ["out"], "out_len": 17,
+     "reply": "input", "in_len": 17, "offset": 6, "match": [[0, 0x08]]},
+    {"name": "Endgame Gear 无线鼠标", "vid": 0x3367, "usage_page": 0xFF01,
+     "requests": ["A1 B4"], "req_kinds": ["set_feat"], "reply": "feature",
+     "reply_id": 0xA1, "offset": 16, "match": [[0, 0xA1], [1, 0x01]],
+     "wait_ms": 350},
+    {"name": "VAXEE / ZYGEN 无线鼠标", "vid": 0x3057, "usage_page": 0xFF05,
+     "requests": ["0E A5 0B 01 01"], "req_kinds": ["set_feat"],
+     "reply": "feature", "reply_id": 0x0E, "offset": 5,
+     "match": [[0, 0x0E]], "scale": 5, "level_max": 20},
+    {"name": "Nordic 2.4G 接收器", "vid": 0x1915, "usage_page": 0xFFA0,
+     "requests": ["05 15 00 00 01"], "req_kinds": ["set_feat"],
+     "reply": "feature", "reply_id": 0x05, "offset": 9, "match": [[0, 0x05]]},
+    {"name": "DARKRIM 耳机", "vid": 0x3654, "usage_page": 0xFF02,
+     "requests": [_jl_query(0x01)], "req_kinds": ["out"], "out_len": 65,
+     "reply": "input", "in_len": 65, "offset": 12,
+     "match": [[1, 0xFE], [10, 0x01], [11, 0x01]]},
+]
+for _p in VENDOR_PRESETS:
+    # 厂商协议只认完全符合特征的回复；第一次请求常被当作唤醒，多试几次
+    _p.update(kind="preset", v=2, strict=True)
+    _p.setdefault("tries", 3)
+    _p.setdefault("timeout_ms", 600)
+del _p
+
+
+def vendor_presets_for(vid: int, ifaces: list) -> list:
+    pages = {d.usage_page for d in ifaces}
+    return [p for p in VENDOR_PRESETS
+            if p["vid"] == vid and p["usage_page"] in pages]
+
+
+def read_vendor_preset(vid: int, ifaces: list):
+    """按内置厂商协议试读一次：返回 (读数, 协议) 或 (None, None)。"""
+    for p in vendor_presets_for(vid, ifaces):
+        try:
+            r = _read_user_protocol(ifaces, p)
+        except Exception:
+            r = None
+        if r and r.ok:
+            return r, {k: v for k, v in p.items() if k != "vid"}
+    return None, None
+
+
+def protocol_source(proto: Optional[dict]) -> str:
+    """卡片上显示的电量来源。"""
+    proto = proto or {}
+    kind = proto.get("kind", "captured")
+    if kind == "standard":
+        return "标准 HID 电量"
+    if proto.get("source") == "import":
+        return "导入协议"
+    if kind == "preset":
+        return "内置协议 · " + str(proto.get("name") or "厂商协议")
+    return "抓包协议"
+
+
+# ---------------------------------------------------------------------------
+# 导入 / 导出协议：把抓包得到的协议分享给同款设备的其他用户
+# ---------------------------------------------------------------------------
+PROTO_FILE_FORMAT = "2.4G-protocol"
+
+
+def _int_field(proto: dict, k: str, lo: int, hi: int):
+    if k not in proto:
+        return None
+    v = proto[k]
+    if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+        raise ValueError(f"字段 {k} 的值不对：{v!r}")
+    return v
+
+
+def clean_protocol(proto) -> dict:
+    """校验一条导入的协议，只保留认识的字段；不合法抛 ValueError（中文说明）。"""
+    if not isinstance(proto, dict):
+        raise ValueError("协议应该是一个 JSON 对象")
+    kind = proto.get("kind", "captured")
+    if kind not in PROTO_KINDS:
+        raise ValueError(f"不认识的协议类型：{kind}")
+    if kind == "standard":
+        return {"kind": "standard"}
+    reqs = proto.get("requests")
+    if not isinstance(reqs, list) or not reqs:
+        raise ValueError("协议里没有请求帧（requests）")
+    for s in reqs:
+        try:
+            b = bytes.fromhex(str(s).replace(" ", ""))
+        except ValueError:
+            raise ValueError(f"请求帧不是十六进制：{s}") from None
+        if not 2 <= len(b) <= 1024:
+            raise ValueError(f"请求帧长度不对：{s}")
+    kinds = proto.get("req_kinds", [])
+    if not isinstance(kinds, list) or any(
+            k not in ("out", "set_out", "set_feat") for k in kinds):
+        raise ValueError("请求类型（req_kinds）不对")
+    if proto.get("reply", "input") not in ("input", "feature", "get_input"):
+        raise ValueError("回复类型（reply）不对")
+    match = proto.get("match", [])
+    if not isinstance(match, list) or any(
+            not isinstance(m, list) or len(m) != 2
+            or not all(isinstance(x, int) and not isinstance(x, bool)
+                       for x in m)
+            or not (0 <= m[0] <= 1023 and 0 <= m[1] <= 255) for m in match):
+        raise ValueError("回复特征（match）不对")
+    for k, lo, hi in (("offset", 0, 1023), ("v", 1, 9), ("out_len", 0, 1024),
+                      ("in_len", 0, 1024), ("reply_id", 0, 255),
+                      ("usage_page", 0, 0xFFFF), ("tries", 1, 5),
+                      ("wait_ms", 0, 2000), ("timeout_ms", 100, 3000),
+                      ("scale", 1, 100), ("level_max", 1, 255)):
+        _int_field(proto, k, lo, hi)
+    out = {k: proto[k] for k in PROTO_KEYS if k in proto}
+    out["kind"] = kind
+    if "name" in out:
+        out["name"] = str(out["name"])[:40]
+    for k in ("invert", "strict"):
+        if k in out:
+            out[k] = bool(out[k])
+    return out
+
+
+def parse_protocol_import(text: str, default_key: str = "") -> dict:
+    """解析导入文件，返回 {"VID:PID": 协议}。
+
+    认三种写法：本软件导出的文件（{"protocols": {...}}）、直接的
+    {"VID:PID": 协议} 表、以及单条协议（需要 default_key 指明是哪台设备）。"""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise ValueError("文件内容不是有效的 JSON，可能不是协议文件") from None
+    if not isinstance(data, dict):
+        raise ValueError("文件格式不对，可能不是协议文件")
+    if isinstance(data.get("protocols"), dict):
+        items = data["protocols"]
+    elif "requests" in data or "kind" in data:
+        if not default_key:
+            raise ValueError("这个文件只有一条协议，没写是哪台设备；"
+                             "请在设备卡片上右键「导入协议」")
+        items = {default_key: data}
+    else:
+        items = data
+    out = {}
+    for k, p in items.items():
+        m = re.fullmatch(r"\s*([0-9A-Fa-f]{4})\s*:\s*([0-9A-Fa-f]{4})\s*",
+                         str(k))
+        if not m:
+            raise ValueError(f"设备编号格式不对：{k}（应为 VID:PID，例如 373B:1216）")
+        key = f"{m.group(1).upper()}:{m.group(2).upper()}"
+        try:
+            out[key] = clean_protocol(p)
+        except ValueError as e:
+            raise ValueError(f"{key}：{e}") from None
+    if not out:
+        raise ValueError("文件里没有协议")
+    return out
+
+
+def import_protocols(text: str, default_key: str = "",
+                     add_devices: bool = False) -> dict:
+    """导入并保存协议；返回 {"VID:PID": 协议}。add_devices 时顺便添加设备（CLI 用）。"""
+    protos = parse_protocol_import(text, default_key)
+    for key, p in protos.items():
+        vid, pid = (int(x, 16) for x in key.split(":"))
+        if p["kind"] == "standard":
+            cfg = load_config()
+            saved = cfg.get("protocols")
+            if not isinstance(saved, dict):
+                saved = {}
+            saved[key] = {"kind": "standard"}
+            cfg["protocols"] = saved
+            save_config(cfg)
+        else:
+            p = protos[key] = dict(p, source="import")
+            save_user_protocol(vid, pid, p, kind=p["kind"])
+        forget_last(vid, pid)
+    if add_devices:
+        devs = load_saved_devices()
+        have = {f"{d['vid']:04X}:{d['pid']:04X}" for d in devs}
+        for key in protos:
+            if key not in have:
+                vid, pid = (int(x, 16) for x in key.split(":"))
+                devs.append({"vid": vid, "pid": pid, "name": ""})
+        save_saved_devices(devs)
+    return protos
+
+
+def export_protocols_text(keys=None) -> str:
+    """导出协议为 JSON 文本；标准 HID 协议不用分享，跳过。"""
+    names = {f"{d['vid']:04X}:{d['pid']:04X}": d.get("name", "")
+             for d in load_saved_devices()}
+    out = {}
+    for key, p in user_protocols().items():
+        if keys is not None and key not in keys:
+            continue
+        if not isinstance(p, dict) or p.get("kind") == "standard":
+            continue
+        q = {k: v for k, v in p.items() if k != "source"}
+        if names.get(key) and not q.get("name"):
+            q["name"] = names[key]
+        out[key] = q
+    return json.dumps({"format": PROTO_FILE_FORMAT, "version": 1,
+                       "protocols": out}, ensure_ascii=False, indent=2)
 
 
 _DESCRIPTOR_PREFIXES = (
@@ -1918,8 +2163,9 @@ def _parse_requests(proto: dict) -> list:
     return out
 
 
-def _reply_value(rep: Optional[bytes], off: int, shift: int, match: list):
-    """回复里取电量：返回 (电量, 严格匹配?)；不符合就返回 None。"""
+def _reply_value(rep: Optional[bytes], off: int, shift: int, match: list,
+                 vmax: int = 100):
+    """回复里取电量原始值：返回 (值, 严格匹配?)；不符合就返回 None。"""
     if not rep or len(rep) <= off + shift:
         return None
     for n, (pos, val) in enumerate(match):
@@ -1927,15 +2173,16 @@ def _reply_value(rep: Optional[bytes], off: int, shift: int, match: list):
             if n == 0:
                 return None
             v = rep[off + shift]
-            return (v, False) if 0 <= v <= 100 else None
+            return (v, False) if 0 <= v <= vmax else None
     v = rep[off + shift]
-    return (v, True) if 0 <= v <= 100 else None
+    return (v, True) if 0 <= v <= vmax else None
 
 
 def _proto_reading(proto: dict, val: int, rep: bytes, how: str) -> Reading:
+    val = min(100, val * int(proto.get("scale", 1) or 1))
     if proto.get("invert"):
         val = 100 - val
-    return Reading(ok=True, level=val, source="抓包协议",
+    return Reading(ok=True, level=val, source=protocol_source(proto),
                    detail=f"{how} {rep[:8].hex(' ')}", raw=rep)
 
 
@@ -1957,6 +2204,24 @@ def _read_v2_protocol(ifaces: list, proto: dict):
     in_len = int(proto.get("in_len", 0) or 0)
     out_len = int(proto.get("out_len", 0) or 0)
     rid = int(proto.get("reply_id", 0) or 0)
+    page = proto.get("usage_page")
+    if page is not None:
+        ifaces = [d for d in ifaces if d.usage_page == int(page)]
+    tries = max(1, min(5, int(proto.get("tries", 1) or 1)))
+    wait = int(proto.get("wait_ms", 0) or 0) / 1000.0
+    timeout = int(proto.get("timeout_ms", 1200) or 1200) / 1000.0
+    strict = bool(proto.get("strict"))
+    vmax = int(proto.get("level_max", 100) or 100)
+    for _ in range(tries):
+        r = _replay_v2_once(ifaces, proto, reqs, off, reply, match, in_len,
+                            out_len, rid, wait, timeout, strict, vmax)
+        if r is not None:
+            return r
+    return None
+
+
+def _replay_v2_once(ifaces, proto, reqs, off, reply, match, in_len, out_len,
+                    rid, wait, timeout, strict, vmax):
     for req, kind in reqs:
         for d in ifaces:
             if kind == "set_feat":
@@ -2000,8 +2265,10 @@ def _read_v2_protocol(ifaces: list, proto: dict):
                         continue
                 else:
                     dev.write_output(buf)
+                if wait:
+                    time.sleep(wait)
                 loose = None
-                deadline = time.monotonic() + 1.2
+                deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
                     if reply == "input":
                         rep = dev.read_input(max(64, d.input_len), 250)
@@ -2010,12 +2277,12 @@ def _read_v2_protocol(ifaces: list, proto: dict):
                         rep = (dev.get_feature_report(rid, d.feature_len)
                                if reply == "feature" else
                                dev.get_input_report(rid, d.input_len))
-                    got = _reply_value(rep, off, shift, match)
+                    got = _reply_value(rep, off, shift, match, vmax)
                     if got is None:
                         continue
                     if got[1]:
                         return _proto_reading(proto, got[0], rep, "回复")
-                    if loose is None:
+                    if loose is None and not strict:
                         loose = (got[0], rep)
                 if loose is not None:
                     return _proto_reading(proto, loose[0], loose[1], "回复")
@@ -2629,6 +2896,38 @@ def _helper_run(args: list):
         sys.argv = old
 
 
+def cli_import(path: str) -> int:
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            protos = import_protocols(f.read(), add_devices=True)
+    except (OSError, ValueError) as e:
+        print(f"导入失败：{e}")
+        return 1
+    for key, p in protos.items():
+        print(f"已导入 {key}（{p.get('name') or protocol_source(p)}）")
+    return 0
+
+
+def cli_export(path: str) -> int:
+    text = export_protocols_text()
+    if not json.loads(text)["protocols"]:
+        print("没有可导出的协议（标准 HID 电量不需要导出）")
+        return 1
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        print(f"导出失败：{e}")
+        return 1
+    print(f"已导出到 {path}")
+    return 0
+
+
+def _arg_after(argv, flag: str) -> str:
+    i = argv.index(flag)
+    return argv[i + 1] if i + 1 < len(argv) else ""
+
+
 def main(argv):
     if argv and argv[0] == "--capture-helper":
         _helper_run(argv[1:])
@@ -2636,6 +2935,13 @@ def main(argv):
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         return 0
+    for flag, fn in (("--import", cli_import), ("--export", cli_export)):
+        if flag in argv:
+            path = _arg_after(argv, flag)
+            if not path:
+                print(f"用法：{flag} 文件.json")
+                return 2
+            return fn(path)
     if "--once" in argv:
         print_once()
         return 0
@@ -2672,6 +2978,7 @@ GLYPH = {
     "device": "", "rename": "", "delete": "",
     "settings": "", "info": "", "bolt": "",
     "bluetooth": "", "hide": "",
+    "import": "", "export": "",
 }
 
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
@@ -3650,8 +3957,10 @@ class HelpWindow(_Fluent):
                                        c["stroke_top"], c["stroke_bot"]))
         self._ctext(32, top + 22, "为什么读不到", c["text"],
                     self._f(11, True), anchor="w")
-        self._ctext(32, top + 44, "接收器在，但厂商协议未收录；软件只做只读试探。",
+        self._ctext(32, top + 44, "接收器在，但内置协议里没有这款设备；可以抓包学习。",
                     c["sub"], self._f(10), anchor="w")
+        self._link(W - 32, top + 22, "有协议文件？直接导入", self._import,
+                   "lnk_import", size=9, anchor="e")
         self._ctext(32, top + 78, "操作步骤", c["text"], self._f(11, True),
                     anchor="w")
         y = top + 104
@@ -3720,6 +4029,10 @@ class HelpWindow(_Fluent):
                         cv.itemconfigure(item, fill=_rgb(_mix(c["card"], col,
                                                                e)))
                 self._anim(0.3, step, delay=0.12 + i * 0.04, key=f"st_{i}")
+
+    def _import(self):
+        if self.parent.import_protocol(self.key, owner=self.root):
+            self.close(animate=True)
 
     def _breathe(self, item):
         c = self.c
@@ -5010,6 +5323,9 @@ class Panel(_Fluent):
         self._ctext(cx, cy + 16, "没有设备", c["text"], self._f(12, True))
         self._ctext(cx, cy + 40, "插入或重新拔插 2.4G 接收器即可添加",
                     c["sub"], self._f(10))
+        self._link(cx, cy + 62, "有别人分享的协议文件？点这里导入",
+                   self.import_protocol, "btn_empty_import", size=9,
+                   anchor="center")
 
     def _toggle(self, x, y, on):
         cv = self.cv
@@ -5140,6 +5456,13 @@ class Panel(_Fluent):
         if r is not None and r.status == "unknown_proto":
             items.append((GLYPH["settings"], "设置读取…",
                           lambda k=key: self.open_help(k)))
+        if r is not None and r.kind != "bluetooth":
+            items.append((GLYPH["import"], "导入协议…",
+                          lambda k=key: self.import_protocol(k)))
+            proto = user_protocols().get(f"{r.vid:04X}:{r.pid:04X}")
+            if isinstance(proto, dict) and proto.get("kind") != "standard":
+                items.append((GLYPH["export"], "导出协议…",
+                              lambda k=key: self.export_protocol(k)))
         items.append((GLYPH["refresh"], "立即刷新", self._refresh))
         items.append(None)
         if r is not None and r.kind == "bluetooth":
@@ -5149,6 +5472,73 @@ class Panel(_Fluent):
             items.append((GLYPH["delete"], "删除设备",
                           lambda k=key: self.delete_device(k)))
         self._menu = FluentMenu(self, items, e.x_root, e.y_root)
+
+    # -- 导入 / 导出协议 ------------------------------------------------------
+    def _device_id(self, key) -> str:
+        r = self.app.snapshot().get(key) if key else None
+        return f"{r.vid:04X}:{r.pid:04X}" if r is not None and r.vid else ""
+
+    def import_protocol(self, key=None, owner=None) -> bool:
+        """选一个协议文件导入；成功后自动添加设备并刷新。"""
+        self._close_menu()
+        owner = owner or self.root
+        self._modal = True
+        try:
+            path = filedialog.askopenfilename(
+                parent=owner, title="导入协议文件",
+                filetypes=[("协议文件", "*.json"), ("所有文件", "*.*")])
+            if not path:
+                return False
+            try:
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    protos = import_protocols(f.read(), self._device_id(key))
+            except (OSError, ValueError) as e:
+                messagebox.showerror("导入协议", f"没能导入：{e}",
+                                     parent=owner)
+                return False
+            for k, p in protos.items():
+                vid, pid = (int(x, 16) for x in k.split(":"))
+                self.app.add_device(vid, pid, "")
+            names = "、".join(
+                f"{p.get('name') or k}" for k, p in list(protos.items())[:3])
+            more = f" 等 {len(protos)} 台设备" if len(protos) > 3 else ""
+            messagebox.showinfo(
+                "导入协议", f"已导入：{names}{more}\n\n设备插着就会马上读取电量；"
+                "没插的话，插上接收器就能看到。", parent=owner)
+            self.app.refresh()
+            return True
+        finally:
+            self._modal = False
+
+    def export_protocol(self, key):
+        self._close_menu()
+        dev_id = self._device_id(key)
+        if not dev_id:
+            return
+        r = self.app.snapshot().get(key)
+        base = re.sub(r'[\\/:*?"<>|\s]+', "_", (r.name or "").strip()) or "设备"
+        self._modal = True
+        try:
+            path = filedialog.asksaveasfilename(
+                parent=self.root, title="导出协议文件",
+                defaultextension=".json",
+                initialfile=f"{base}_{dev_id.replace(':', '')}.json",
+                filetypes=[("协议文件", "*.json")])
+            if not path:
+                return
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(export_protocols_text([dev_id]))
+            except OSError as e:
+                messagebox.showerror("导出协议", f"没能保存：{e}",
+                                     parent=self.root)
+                return
+            messagebox.showinfo(
+                "导出协议", f"已保存到：\n{path}\n\n把这个文件发给用同款设备的朋友，"
+                "对方右键托盘图标 →「导入协议…」选中它就能用。",
+                parent=self.root)
+        finally:
+            self._modal = False
 
     def delete_device(self, key: str):
         self._close_menu()
@@ -5415,6 +5805,7 @@ MF_SEPARATOR = 0x0800
 TPM_RIGHTBUTTON = 0x0002
 TPM_RETURNCMD = 0x0100
 TRAY_OPEN, TRAY_REFRESH, TRAY_STARTUP, TRAY_QUIT, TRAY_BT = 1, 2, 3, 4, 5
+TRAY_IMPORT = 6
 
 
 def allow_dark_menus() -> None:
@@ -5577,6 +5968,7 @@ class Tray:
         try:
             user32.AppendMenuW(menu, MF_STRING, TRAY_OPEN, "打开电量面板")
             user32.AppendMenuW(menu, MF_STRING, TRAY_REFRESH, "立即刷新")
+            user32.AppendMenuW(menu, MF_STRING, TRAY_IMPORT, "导入协议…")
             user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
             user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if
                                load_config().get("bluetooth", True) else 0),
@@ -5752,6 +6144,8 @@ class TrayApp:
             self.refresh()
         elif cmd == TRAY_REFRESH:
             self.refresh()
+        elif cmd == TRAY_IMPORT:
+            self.panel.import_protocol()
         elif cmd == TRAY_STARTUP:
             self.panel._toggle_startup()
         elif cmd == TRAY_BT:

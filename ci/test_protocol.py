@@ -5,6 +5,7 @@
 """
 import ctypes
 import importlib.util
+import json
 import os
 import struct
 import sys
@@ -279,6 +280,191 @@ def format_reports_handles_synthetic():
     text = md.format_reports([(md.EP_CTRL_OUT, md.XFER_SET_FEATURE, b"\x05\x10"),
                               (0x81, 1, b"\x06\x01\x00\x4b")])
     assert "len=2" in text and "06 01 00 4B" in text, text
+
+
+# -- 内置厂商协议 ------------------------------------------------------------------
+def hid(path, vid, pid, page, inp=0, out=0, feat=0):
+    return md.HidIface(path=path, vid=vid, pid=pid, usage_page=page, usage=1,
+                       input_len=inp, output_len=out, feature_len=feat)
+
+
+def preset(name_part):
+    return next(p for p in md.VENDOR_PRESETS if name_part in p["name"])
+
+
+def jl_reply(payload):
+    f = bytearray(65)
+    f[1], f[3], f[5] = 0xFE, 0x10, 0x02
+    f[8] = len(payload)
+    f[10:10 + len(payload)] = payload
+    crc = 0xFFFF
+    for b in f[1:10 + len(payload)]:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = (((crc << 1) ^ 0x1021) if crc & 0x8000 else crc << 1) & 0xFFFF
+    f[10 + len(payload)], f[11 + len(payload)] = crc >> 8, crc & 0xFF
+    return bytes(f)
+
+
+@case
+def preset_atk_v2():
+    """ATK 协议 2：只认 08 72 .. 07 特征的回复，别的报告里的数字不采信。"""
+    SCRIPTS["m"] = {"input": [pad((0x08, 0x10, 0, 0, 0, 0, 0, 55), 64),
+                              pad((0x08, 0x72, 2, 0, 1, 7, 1, 83), 64)]}
+    r = md._read_user_protocol([hid("m", 0x373B, 0x1216, 0xFF05, 64, 64)],
+                               preset("ATK / VXE 无线鼠标"))
+    assert r and r.level == 83 and "内置协议" in r.source, r
+    assert FakeDev.log == [("write", pad(bytes.fromhex("087D720200010701"),
+                                         64))], FakeDev.log
+
+
+@case
+def preset_darkrim_crc():
+    """DARKRIM：查询帧 CRC 与原仓库一致，回复里 TLV 0x01 是电量。"""
+    p = preset("DARKRIM")
+    assert p["requests"][0].endswith("01 00 58 09"), p["requests"]
+    SCRIPTS["h"] = {"input": [jl_reply(b"\x02\x03ABC"),
+                              jl_reply(b"\x01\x01\x46")]}
+    r = md._read_user_protocol([hid("h", 0x3654, 0x6901, 0xFF02, 65, 65)], p)
+    assert r and r.level == 70, r
+
+
+@case
+def preset_vaxee_scale():
+    """VAXEE 以 5% 为一档：原始值 ×5，超过 20 的原始值不采信。"""
+    p = preset("VAXEE")
+    SCRIPTS["v"] = {"feature": [pad((0x0E, 0, 0, 0, 0, 40), 64),
+                                pad((0x0E, 0, 0, 0, 0, 17), 64)]}
+    r = md._read_user_protocol([hid("v", 0x3057, 1, 0xFF05, feat=64)], p)
+    assert r and r.level == 85, r
+    assert FakeDev.log[0] == ("set_feat", pad(bytes.fromhex("0EA50B0101"), 64))
+
+
+@case
+def preset_endgame_busy_then_ok():
+    """Endgame：第 1 字节 0x03（忙）的回复不采信，继续等到 0x01（有效）。"""
+    p = dict(preset("Endgame"), wait_ms=0)
+    busy = pad((0xA1, 0x03) + (0,) * 14 + (99,), 64)
+    ok = pad((0xA1, 0x01) + (0,) * 14 + (64,), 64)
+    SCRIPTS["e"] = {"feature": [busy, ok]}
+    r = md._read_user_protocol([hid("e", 0x3367, 1, 0xFF01, feat=64)], p)
+    assert r and r.level == 64, r
+
+
+@case
+def preset_skips_other_interfaces():
+    """只往协议指定的厂商接口发请求，不碰同一设备的其它接口。"""
+    p = dict(preset("Nordic"), tries=1, timeout_ms=100)
+    SCRIPTS["k"] = {}
+    SCRIPTS["n"] = {"feature": [pad((0x05,) + (0,) * 8 + (77,), 32)]}
+    r = md._read_user_protocol([hid("k", 0x1915, 1, 0xFF00, feat=32),
+                                hid("n", 0x1915, 1, 0xFFA0, feat=32)], p)
+    assert r and r.level == 77, r
+    assert all(e[0] != "set_feat" or len(e[1]) == 32 for e in FakeDev.log)
+    assert len([e for e in FakeDev.log if e[0] == "set_feat"]) == 1
+
+
+@case
+def preset_auto_detect_saves():
+    """没有协议的设备按 VID 命中内置协议，读到后保存，下次直接用。"""
+    store = {}
+    md.load_config = lambda: json.loads(json.dumps(store))
+    md.save_config = lambda cfg: (store.clear(), store.update(cfg))
+    md.read_standard_battery = lambda d: None
+    SCRIPTS["m"] = {"input": [pad((0x08, 0x72, 2, 0, 1, 7, 1, 50), 64)]}
+    ifs = [hid("m", 0x373B, 0x1216, 0xFF05, 64, 64)]
+    r = md.read_saved_device({"vid": 0x373B, "pid": 0x1216, "name": ""}, ifs)
+    assert r.ok and r.level == 50, r
+    saved = store["protocols"]["373B:1216"]
+    assert saved["kind"] == "preset" and saved["usage_page"] == 0xFF05, saved
+    SCRIPTS["m"] = {"input": []}
+    r = md.read_saved_device({"vid": 0x373B, "pid": 0x1216, "name": ""}, ifs)
+    assert r.status == "asleep" and "内置协议" in r.source, r
+    # 不认识的 VID 不发任何请求，仍是“协议未知”
+    FakeDev.log = []
+    SCRIPTS["x"] = {}
+    r = md.read_saved_device({"vid": 0x1234, "pid": 1, "name": ""},
+                             [hid("x", 0x1234, 1, 0xFF05, 64, 64)])
+    assert r.status == "unknown_proto" and FakeDev.log == [], (r, FakeDev.log)
+
+
+# -- 导入 / 导出协议 ----------------------------------------------------------------
+@case
+def import_export_round_trip():
+    store = {"devices": [{"vid": VID, "pid": PID, "name": "我的鼠标"}],
+             "protocols": {f"{VID:04X}:{PID:04X}": {
+                 "kind": "captured", "v": 2, "requests": ["06 01"],
+                 "req_kinds": ["out"], "offset": 3, "reply": "input",
+                 "match": [[0, 6]], "invert": False},
+                 "AAAA:BBBB": {"kind": "standard"}},
+             "last": {md.device_key(VID, PID): {"level": 10}}}
+    md.load_config = lambda: json.loads(json.dumps(store))
+    md.save_config = lambda cfg: (store.clear(), store.update(cfg))
+    text = md.export_protocols_text()
+    data = json.loads(text)
+    assert list(data["protocols"]) == [f"{VID:04X}:{PID:04X}"], data
+    assert data["protocols"][f"{VID:04X}:{PID:04X}"]["name"] == "我的鼠标"
+    store.clear()
+    got = md.import_protocols(text, add_devices=True)
+    p = store["protocols"][f"{VID:04X}:{PID:04X}"]
+    assert list(got) == [f"{VID:04X}:{PID:04X}"]
+    assert p["source"] == "import" and p["requests"] == ["06 01"], p
+    assert md.protocol_source(p) == "导入协议"
+    assert store["devices"] == [{"vid": VID, "pid": PID, "name": ""}], store
+
+
+@case
+def import_single_protocol_needs_device():
+    single = json.dumps({"requests": ["06 01"], "offset": 3})
+    try:
+        md.parse_protocol_import(single)
+        raise AssertionError("应当要求指明设备")
+    except ValueError as e:
+        assert "右键" in str(e), e
+    out = md.parse_protocol_import(single, "1A2B:3C4D")
+    assert out["1A2B:3C4D"]["kind"] == "captured", out
+
+
+@case
+def import_rejects_bad_files():
+    bad = [
+        ("不是 JSON", "JSON"),
+        ('[1, 2]', "格式不对"),
+        ('{"protocols": {"12:34": {"requests": ["06 01"]}}}', "设备编号"),
+        ('{"protocols": {"1234:5678": {"requests": ["zz"]}}}', "十六进制"),
+        ('{"protocols": {"1234:5678": {"requests": ["06 01"], '
+         '"offset": -1}}}', "offset"),
+        ('{"protocols": {"1234:5678": {"kind": "evil"}}}', "类型"),
+        ('{"protocols": {}}', "没有协议"),
+    ]
+    for text, why in bad:
+        try:
+            md.parse_protocol_import(text)
+            raise AssertionError(text)
+        except ValueError as e:
+            assert why in str(e), (text, str(e))
+    # 认识的字段之外一律丢弃
+    out = md.parse_protocol_import(
+        '{"1234:5678": {"requests": ["06 01"], "offset": 3, "evil": 1}}')
+    assert "evil" not in out["1234:5678"], out
+
+
+@case
+def cli_import_file():
+    store = {}
+    md.load_config = lambda: json.loads(json.dumps(store))
+    md.save_config = lambda cfg: (store.clear(), store.update(cfg))
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8-sig") as f:  # 记事本存的带 BOM
+        f.write('{"protocols": {"373b:1216": {"requests": ["08 7D"], '
+                '"offset": 7, "v": 2}}}')
+    try:
+        assert md.main(["--import", path]) == 0
+        assert md.main(["--import"]) == 2
+    finally:
+        os.remove(path)
+    assert "373B:1216" in store["protocols"], store
+    assert store["devices"][0]["vid"] == 0x373B, store
 
 
 print(f"\n{len(passed)} protocol tests passed")
