@@ -118,13 +118,16 @@ for light in (False, True):
         pump(p.root, 1.5)
         grab(p.root, f"panel_{label}_{tag}")
         if label == "devices":
+            cy = p._list[0] + p.CARD_H / 2  # 第一张卡片中间
             ev = types.SimpleNamespace(
-                x=int(200 * p.S), y=int(80 * p.S),
+                x=int(200 * p.S), y=int(cy * p.S),
                 x_root=p.root.winfo_rootx() + int(200 * p.S),
-                y_root=p.root.winfo_rooty() + int(80 * p.S))
+                y_root=p.root.winfo_rooty() + int(cy * p.S))
             p._on_right_click(ev)
             pump(p.root, 0.3)
-            if p._menu:
+            if not p._menu:
+                errors.append("right-click on the first card opened no menu")
+            else:
                 grab(p._menu.root, f"menu_{tag}")
                 p._close_menu()
             p._edit_name_at("a")
