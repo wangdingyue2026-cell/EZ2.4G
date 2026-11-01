@@ -2815,8 +2815,77 @@ def import_protocols(text: str, default_key: str = "",
     return out
 
 
-def device_info_text(r: "Reading", ifaces=None) -> str:
-    """设备诊断信息：接口指纹、认领它的适配器、已保存协议、最近一次读数。"""
+def listen_targets(cand: list) -> list:
+    """可以只读监听的接口：厂商自定义（usage page ≥ 0xFF00）且有输入报告。
+    普通键盘 / 鼠标接口不听，按键内容不会被记录。"""
+    return [d for d in cand if d.usage_page >= 0xFF00 and d.input_len > 0]
+
+
+def listen_vendor_reports(cand: list, seconds: float) -> list:
+    """只读监听厂商接口上设备自己发出来的报告，一个字节都不写。
+
+    返回 [(接口标签, [(秒, 字节), …] 或 错误说明)]。每个接口一个线程同时听。"""
+    targets = listen_targets(cand)
+    results = [None] * len(targets)
+
+    def work(i, d):
+        frames = []
+        dev = None
+        try:
+            dev = HidDevice(d.path, write=False)
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < seconds:
+                rep = dev.read_input(max(64, d.input_len), 250)
+                if rep:
+                    frames.append((time.monotonic() - t0, bytes(rep)))
+            results[i] = frames
+        except Exception as e:
+            results[i] = f"打不开（{e}）"
+        finally:
+            if dev is not None:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+
+    threads = [threading.Thread(target=work, args=(i, d), daemon=True)
+               for i, d in enumerate(targets)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(seconds + 3)
+    return [(f"UP={d.usage_page:04X} in={d.input_len}",
+             results[i] if results[i] is not None else "超时")
+            for i, d in enumerate(targets)]
+
+
+def _listen_lines(results: list, seconds: float) -> list:
+    lines = [f"只读监听 {seconds:g} 秒（只听设备自己发的数据，不向设备写入任何东西）："]
+    if not results:
+        return lines + ["  没有可以监听的厂商接口"]
+    for label, frames in results:
+        if isinstance(frames, str):
+            lines.append(f"  {label}：{frames}")
+            continue
+        lines.append(f"  {label}：共 {len(frames)} 帧")
+        shown, prev, count = 0, None, 0
+        for t, rep in frames + [(None, None)]:
+            if rep == prev:
+                count += 1
+                continue
+            if prev is not None and shown < 40:
+                tail = f" ×{count}" if count > 1 else ""
+                lines.append(f"    {t0:5.1f}s  {prev.hex(' ').upper()}{tail}")
+                shown += 1
+            prev, count, t0 = rep, 1, t
+        if shown >= 40:
+            lines.append("    ……（后面的省略）")
+    return lines
+
+
+def device_info_text(r: "Reading", ifaces=None, listen: float = 0) -> str:
+    """设备诊断信息：接口指纹、认领它的适配器、已保存协议、最近一次读数；
+    listen > 0 时再只读监听厂商接口这么多秒，附上设备自己发出的数据。"""
     vid, pid = r.vid, r.pid
     try:
         ifaces = ifaces if ifaces is not None else enumerate_hid()
@@ -2841,6 +2910,8 @@ def device_info_text(r: "Reading", ifaces=None) -> str:
     lines.append(f"最近读数：{state}（{r.source or '-'}；{r.detail or '-'}）")
     if r.raw:
         lines.append("最近回复：" + bytes(r.raw[:64]).hex(" ").upper())
+    if listen > 0 and cand:
+        lines += _listen_lines(listen_vendor_reports(cand, listen), listen)
     lines.append(f"程序：2.4G 外设电量 · Python {sys.version.split()[0]}")
     return "\n".join(lines)
 
@@ -6541,6 +6612,8 @@ class Panel(_Fluent):
         self._modal = False
         self._editing = False
         self._picker = None
+        self._listening = False
+        self._note = ""
         self._scroll = 0.0
         self._render_scroll = 0.0
         self._max_scroll = 0.0
@@ -6955,9 +7028,10 @@ class Panel(_Fluent):
         cv.create_line(0, foot_y, W, foot_y, fill=_rgb(c["divider"]),
                        width=self._px(1))
         self._ctext(18, foot_y + self.FOOT_H / 2,
-                    "编辑中：可以改名或删除设备" if self._editing
-                    else self._updated_text(),
-                    c["link"] if self._editing else c["sub"], self._f(10),
+                    self._note or ("编辑中：可以改名或删除设备" if self._editing
+                                   else self._updated_text()),
+                    c["link"] if (self._editing or self._note) else c["sub"],
+                    self._f(10),
                     anchor="w")
         tx = W - 18 - 40
         self._toggle(tx, foot_y + (self.FOOT_H - 20) / 2, self._startup_var)
@@ -7469,21 +7543,68 @@ class Panel(_Fluent):
         finally:
             self._modal = False
 
+    LISTEN_SECONDS = 10
+
     def copy_device_info(self, key):
-        """把这台设备的接口指纹和最近一次回复复制到剪贴板，提 Issue 适配新设备用。"""
+        """把这台设备的接口指纹和最近一次回复复制到剪贴板，提 Issue 适配新设备用。
+        有厂商接口时可以先只读监听 10 秒，把设备自己发出的数据也附上。"""
         self._close_menu()
         r = self.app.snapshot().get(key)
-        if r is None or not r.vid:
+        if r is None or not r.vid or self._listening:
             return
-        text = device_info_text(r)
+        try:
+            cand = [d for d in enumerate_hid()
+                    if d.vid == r.vid and d.pid == r.pid]
+        except Exception:
+            cand = []
+        listen = 0
+        if listen_targets(cand):
+            self._modal = True
+            try:
+                ok = messagebox.askyesnocancel(
+                    "复制设备信息",
+                    f"要不要顺便监听 {self.LISTEN_SECONDS} 秒？\n\n"
+                    "监听时只读取设备自己发出的数据，不会向设备写入任何东西，"
+                    "也不记录普通按键。\n\n"
+                    f"点「是」后的 {self.LISTEN_SECONDS} 秒里，请把设备关机再开机"
+                    "（很多设备会在连上时报告电量），也可以正常用一用。\n\n"
+                    "「是」= 监听后复制　「否」= 只复制接口信息",
+                    parent=self.root)
+            finally:
+                self._modal = False
+            if ok is None:
+                return
+            listen = self.LISTEN_SECONDS if ok else 0
+        if not listen:
+            self._finish_copy(device_info_text(r, cand), False)
+            return
+        done = queue.SimpleQueue()
+        self._listening = True
+        self._note = f"正在监听设备数据（{listen} 秒），请把设备关机再开机…"
+        self.render()
+        threading.Thread(target=lambda: done.put(
+            device_info_text(r, cand, listen)), daemon=True).start()
+
+        def poll():
+            if done.empty():
+                self.root.after(200, poll)
+                return
+            self._listening = False
+            self._note = ""
+            self.render()
+            self._finish_copy(done.get(), True)
+        self.root.after(200, poll)
+
+    def _finish_copy(self, text: str, listened: bool):
         self._modal = True
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
             messagebox.showinfo(
-                "复制设备信息", "已复制到剪贴板。\n\n想让软件支持这台设备，可以到项目主页"
-                "提一个 Issue，把这段信息粘贴进去，并写上设备型号。",
-                parent=self.root)
+                "复制设备信息", "已复制到剪贴板" +
+                ("（含监听到的数据）" if listened else "") +
+                "。\n\n想让软件支持这台设备，可以到项目主页提一个 Issue，"
+                "把这段信息粘贴进去，并写上设备型号。", parent=self.root)
         finally:
             self._modal = False
 

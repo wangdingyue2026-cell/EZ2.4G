@@ -636,6 +636,30 @@ def device_art_and_kind():
     assert got[0]["kind"] == "mouse", got
 
 
+@case
+def listen_is_read_only_and_vendor_only():
+    """只读监听：只听厂商接口、不听键盘接口，全程零写入；重复帧合并计数。
+    用的是用户反馈的 SKN 青龙键盘（05AC:024F）的真实接口。"""
+    def iface(path, page, usage, inp, out):
+        return md.HidIface(path, 0x05AC, 0x024F, page, usage, inp, out, 0)
+    cand = [iface("kb", 0x0001, 6, 9, 2), iface("ffb5", 0xFFB5, 1, 8, 8),
+            iface("cc", 0x000C, 1, 3, 0)]
+    assert [d.path for d in md.listen_targets(cand)] == ["ffb5"]
+    frame = H("05 01 64 00 00 00 00 00")
+    SCRIPTS["ffb5"] = {"input": [frame, frame, H("05 02 00 00 00 00 00 00")]}
+    SCRIPTS["kb"] = {"input": [H("00 00 04 00 00 00 00 00 00")]}
+    r = md.Reading(ok=False, name="SKN-2.4G keyboard", status="unknown_proto")
+    r.vid, r.pid = 0x05AC, 0x024F
+    text = md.device_info_text(r, cand, listen=0.3)
+    assert "UP=FFB5 in=8：共 3 帧" in text, text
+    assert "05 01 64 00 00 00 00 00 ×2" in text, text
+    assert "00 00 04" not in text                         # 键盘接口没被听
+    assert not [e for e in FakeDev.log if e[0] in ("write", "set_out",
+                                                   "set_feat")], FakeDev.log
+    plain = md.device_info_text(r, cand)
+    assert "只读监听" not in plain
+
+
 # -- 导入设备规格（声明式适配器，带真机样本） ----------------------------------------
 GOOD_SPEC = {"name": "示例 鼠标", "kind": "mouse", "ids": [["ABCD", "0001"]],
              "page": "0xFF02", "lens": {"in": 17, "out": 17},
