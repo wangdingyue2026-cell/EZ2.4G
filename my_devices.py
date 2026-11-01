@@ -27,6 +27,7 @@ import sys
 import tempfile
 import queue
 import random
+import re
 import threading
 import time
 from typing import Optional
@@ -478,6 +479,7 @@ class Reading:
     pid: int = 0
     usage_page: int = 0
     hid_known: bool = False
+    kind: str = "hid"        # hid = 2.4G 接收器；bluetooth = 蓝牙设备
 
     @property
     def text(self) -> str:
@@ -519,6 +521,198 @@ def read_standard_battery(iface: HidIface) -> Optional[Reading]:
     finally:
         dev.close()
     return None
+
+
+# ===========================================================================
+# 蓝牙电量：读 Windows 自己维护的设备属性（与“设置 > 蓝牙和其他设备”一致）
+# ===========================================================================
+class DEVPROPKEY(ctypes.Structure):
+    _fields_ = [("fmtid", GUID), ("pid", wt.ULONG)]
+
+
+class SP_DEVINFO_DATA(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("ClassGuid", GUID),
+                ("DevInst", wt.DWORD), ("Reserved", ctypes.c_void_p)]
+
+
+class SYSTEMTIME(ctypes.Structure):
+    _fields_ = [(n, wt.WORD) for n in ("wYear", "wMonth", "wDayOfWeek", "wDay",
+                                        "wHour", "wMinute", "wSecond",
+                                        "wMilliseconds")]
+
+
+class BLUETOOTH_DEVICE_SEARCH_PARAMS(ctypes.Structure):
+    _fields_ = [("dwSize", wt.DWORD), ("fReturnAuthenticated", wt.BOOL),
+                ("fReturnRemembered", wt.BOOL), ("fReturnUnknown", wt.BOOL),
+                ("fReturnConnected", wt.BOOL), ("fIssueInquiry", wt.BOOL),
+                ("cTimeoutMultiplier", ctypes.c_ubyte), ("hRadio", wt.HANDLE)]
+
+
+class BLUETOOTH_DEVICE_INFO(ctypes.Structure):
+    _fields_ = [("dwSize", wt.DWORD), ("Address", ctypes.c_ulonglong),
+                ("ulClassofDevice", wt.ULONG), ("fConnected", wt.BOOL),
+                ("fRemembered", wt.BOOL), ("fAuthenticated", wt.BOOL),
+                ("stLastSeen", SYSTEMTIME), ("stLastUsed", SYSTEMTIME),
+                ("szName", wt.WCHAR * 248)]
+
+
+DIGCF_ALLCLASSES = 0x04
+DEVPROP_TYPE_BYTE = 0x03
+DEVPROP_TYPE_GUID = 0x0D
+DEVPROP_TYPE_STRING = 0x12
+DEVPKEY_BLUETOOTH_BATTERY = ("{104EA319-6EE2-4701-BD47-8DDBF425BBE5}", 2)
+DEVPKEY_NAME = ("{B725F130-47EF-101A-A5F1-02608C9EEBAC}", 10)
+DEVPKEY_DEVICE_CONTAINER_ID = ("{8C7ED206-3F8A-4827-B3AB-AE9E1FAEFC6C}", 2)
+BT_ENUMERATORS = ("BTHENUM\\", "BTHLE\\", "BTHLEDEVICE\\", "BTHHFENUM\\")
+
+setupapi.SetupDiEnumDeviceInfo.argtypes = [wt.HANDLE, wt.DWORD,
+                                           ctypes.POINTER(SP_DEVINFO_DATA)]
+setupapi.SetupDiGetDevicePropertyW.argtypes = [
+    wt.HANDLE, ctypes.POINTER(SP_DEVINFO_DATA), ctypes.POINTER(DEVPROPKEY),
+    ctypes.POINTER(wt.ULONG), ctypes.c_void_p, wt.DWORD,
+    ctypes.POINTER(wt.DWORD), wt.DWORD]
+# 第二个参数是 SP_DEVINFO_DATA；HID 枚举那边传的是接口数据，统一放宽成指针
+setupapi.SetupDiGetDeviceInstanceIdW.argtypes = [
+    wt.HANDLE, ctypes.c_void_p, wt.LPWSTR, wt.DWORD, ctypes.POINTER(wt.DWORD)]
+
+
+def _devprop(hdev, info, key) -> Optional[tuple]:
+    """读一个设备属性，返回 (类型, 原始字节)。"""
+    k = DEVPROPKEY()
+    k.fmtid = GUID(key[0])
+    k.pid = key[1]
+    typ = wt.ULONG(0)
+    need = wt.DWORD(0)
+    buf = ctypes.create_string_buffer(1024)
+    if not setupapi.SetupDiGetDevicePropertyW(
+            hdev, ctypes.byref(info), ctypes.byref(k), ctypes.byref(typ),
+            buf, 1024, ctypes.byref(need), 0):
+        return None
+    return typ.value, buf.raw[:need.value]
+
+
+def _bt_nodes() -> list:
+    """所有带电量属性的蓝牙设备节点：[{inst, level, name, container}]。"""
+    hdev = setupapi.SetupDiGetClassDevsW(None, None, None,
+                                         DIGCF_PRESENT | DIGCF_ALLCLASSES)
+    if not hdev or hdev == INVALID_HANDLE_VALUE:
+        return []
+    out = []
+    try:
+        i = 0
+        while True:
+            info = SP_DEVINFO_DATA()
+            info.cbSize = ctypes.sizeof(info)
+            if not setupapi.SetupDiEnumDeviceInfo(hdev, i, ctypes.byref(info)):
+                break
+            i += 1
+            inst = ctypes.create_unicode_buffer(512)
+            if not setupapi.SetupDiGetDeviceInstanceIdW(
+                    hdev, ctypes.byref(info), inst, 512, None):
+                continue
+            if not inst.value.upper().startswith(BT_ENUMERATORS):
+                continue
+            bat = _devprop(hdev, info, DEVPKEY_BLUETOOTH_BATTERY)
+            if not bat or bat[0] != DEVPROP_TYPE_BYTE or not bat[1]:
+                continue
+            name = _devprop(hdev, info, DEVPKEY_NAME)
+            cont = _devprop(hdev, info, DEVPKEY_DEVICE_CONTAINER_ID)
+            out.append({
+                "inst": inst.value,
+                "level": bat[1][0],
+                "name": (name[1].decode("utf-16-le", "ignore").split("\0")[0]
+                         if name and name[0] == DEVPROP_TYPE_STRING else ""),
+                "container": (cont[1].hex()
+                              if cont and cont[0] == DEVPROP_TYPE_GUID else ""),
+            })
+    finally:
+        setupapi.SetupDiDestroyDeviceInfoList(hdev)
+    return out
+
+
+def _bt_connected() -> dict:
+    """{蓝牙地址(12 位十六进制): 是否已连接}，来自 Windows 已配对设备列表。"""
+    try:
+        bt = ctypes.WinDLL("bthprops.cpl")
+        bt.BluetoothFindFirstDevice.restype = ctypes.c_void_p
+        bt.BluetoothFindFirstDevice.argtypes = [
+            ctypes.POINTER(BLUETOOTH_DEVICE_SEARCH_PARAMS),
+            ctypes.POINTER(BLUETOOTH_DEVICE_INFO)]
+        bt.BluetoothFindNextDevice.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(BLUETOOTH_DEVICE_INFO)]
+        bt.BluetoothFindDeviceClose.argtypes = [ctypes.c_void_p]
+    except Exception:
+        return {}
+    p = BLUETOOTH_DEVICE_SEARCH_PARAMS()
+    p.dwSize = ctypes.sizeof(p)
+    p.fReturnAuthenticated = p.fReturnRemembered = p.fReturnConnected = True
+    info = BLUETOOTH_DEVICE_INFO()
+    info.dwSize = ctypes.sizeof(info)
+    h = bt.BluetoothFindFirstDevice(ctypes.byref(p), ctypes.byref(info))
+    if not h:
+        return {}
+    out = {}
+    try:
+        while True:
+            out["%012X" % info.Address] = bool(info.fConnected)
+            info.dwSize = ctypes.sizeof(info)
+            if not bt.BluetoothFindNextDevice(h, ctypes.byref(info)):
+                break
+    finally:
+        bt.BluetoothFindDeviceClose(h)
+    return out
+
+
+def _bt_address(inst: str) -> str:
+    """从设备实例 ID 里取蓝牙地址：最后一段独立的 12 位十六进制
+    （BTHENUM 的 ..._001A7DDA7113_C00000000、BTHLE 的 DEV_C1D2E3F4A5B6）。"""
+    found = re.findall(r"(?<![0-9A-F])([0-9A-F]{12})(?![0-9A-F])",
+                       inst.upper())
+    return found[-1] if found else ""
+
+
+def _bt_merge(nodes: list, connected: dict) -> dict[str, Reading]:
+    """同一台设备常有多个节点（音频/免提/GATT 服务），按容器 ID 合并成一张卡。
+    Windows 确认已断开的设备不显示（属性里留的是断开前的旧电量）。"""
+    groups: dict[str, list] = {}
+    for n in nodes:
+        gid = n.get("container") or _bt_address(n["inst"]) or n["inst"]
+        groups.setdefault(gid, []).append(n)
+    out: dict[str, Reading] = {}
+    for gid, ns in groups.items():
+        addr = next((a for a in (_bt_address(n["inst"]) for n in ns) if a), "")
+        conn = connected.get(addr)
+        if conn is False:
+            continue
+        level = next((n["level"] for n in ns if 0 <= n["level"] <= 100), None)
+        if level is None:
+            continue
+        name = next((n["name"] for n in ns if n["name"]), "") or "蓝牙设备"
+        key = "bt_" + (addr or gid[:12]).lower()
+        r = Reading(ok=True, level=level, status="bluetooth", source="蓝牙",
+                    detail="已连接" if conn else "", name=name)
+        r.kind = "bluetooth"
+        out[key] = r
+    return out
+
+
+def read_bluetooth_all() -> dict[str, Reading]:
+    cfg = load_config()
+    if not cfg.get("bluetooth", True):
+        return {}
+    hidden = set(cfg.get("bt_hidden") or [])
+    try:
+        res = _bt_merge(_bt_nodes(), _bt_connected())
+    except Exception:
+        return {}
+    names = custom_names()
+    out = {}
+    for key, r in res.items():
+        if key in hidden:
+            continue
+        r.name = names.get(key) or r.name
+        out[key] = r
+    return out
 
 
 # ===========================================================================
@@ -1899,18 +2093,21 @@ def set_custom_name(key: str, name: str) -> None:
 # CLI
 # ===========================================================================
 def read_saved_all(devices: Optional[list] = None) -> dict[str, Reading]:
-    """读一遍已添加的设备（托盘刷新与 --once 共用），没读到的沿用上次电量。"""
+    """读一遍已添加的 2.4G 设备和已连接的蓝牙设备（托盘刷新与 --once 共用），
+    2.4G 设备没读到的沿用上次电量。"""
     devices = load_saved_devices() if devices is None else devices
     ifaces = enumerate_hid()
     res = {device_key(d["vid"], d["pid"]): read_saved_device(d, ifaces)
            for d in devices}
-    return apply_last_known(res)
+    res = apply_last_known(res)
+    res.update(read_bluetooth_all())
+    return res
 
 
 def print_once():
     res = read_saved_all()
     if not res:
-        print("还没有添加设备：先运行托盘程序，插入接收器后在弹窗里点「添加」。")
+        print("没有设备：2.4G 设备需先在托盘程序里添加；蓝牙设备要已连接并上报电量。")
         return
     for r in res.values():
         if r.ok:
@@ -2187,6 +2384,7 @@ GLYPH = {
     "headset": "", "keyboard": "", "gamepad": "",
     "device": "", "rename": "", "delete": "",
     "settings": "", "info": "", "bolt": "",
+    "bluetooth": "", "hide": "",
 }
 
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
@@ -2280,7 +2478,7 @@ def level_rgb(level: Optional[int], c: dict) -> tuple:
     return c["bad"]
 
 
-def _device_glyph(name: str) -> str:
+def _device_glyph(name: str, fallback: str = "device") -> str:
     n = (name or "").lower()
     for words, key in ((("mouse", "鼠标", "mice"), "mouse"),
                        (("headset", "耳机", "buds", "headphone", "audio"),
@@ -2289,7 +2487,7 @@ def _device_glyph(name: str) -> str:
                        (("gamepad", "controller", "手柄"), "gamepad")):
         if any(w in n for w in words):
             return GLYPH[key]
-    return GLYPH["device"]
+    return GLYPH[fallback]
 
 
 _ICON_FONT = None
@@ -4298,6 +4496,10 @@ class Panel(_Fluent):
 
     def _subtitle(self, r: Reading):
         """返回 (文字, 是否附带“设置读取”链接)。"""
+        if r.kind == "bluetooth":
+            st = "电量低" if r.level is not None and r.level < 20 else (
+                r.detail or "")
+            return ("蓝牙 · " + st if st else "蓝牙"), False
         if r.status == "unknown_proto":
             return "协议未知", True
         if r.stale:
@@ -4339,7 +4541,9 @@ class Panel(_Fluent):
         cv.create_image(x1 + 14, cy - 19, anchor="nw", tags=tags,
                         image=self._disc(38, well))
         gcol = _mix(col, c["text"], 0.35) if lv is not None else c["text"]
-        texts.append((self._ctext(x1 + 33, cy, _device_glyph(r.name), gcol,
+        glyph = _device_glyph(r.name, "bluetooth" if r.kind == "bluetooth"
+                              else "device")
+        texts.append((self._ctext(x1 + 33, cy, glyph, gcol,
                                   self._fi(15), tags=tags), gcol))
         if r.ok and r.status == "charging" and not r.stale:
             b = cv.create_image(x1 + 38, cy + 5, anchor="nw", tags=tags,
@@ -4588,8 +4792,12 @@ class Panel(_Fluent):
                           lambda k=key: self.open_help(k)))
         items.append((GLYPH["refresh"], "立即刷新", self._refresh))
         items.append(None)
-        items.append((GLYPH["delete"], "删除设备",
-                      lambda k=key: self.delete_device(k)))
+        if r is not None and r.kind == "bluetooth":
+            items.append((GLYPH["hide"], "不再显示",
+                          lambda k=key: self.delete_device(k)))
+        else:
+            items.append((GLYPH["delete"], "删除设备",
+                          lambda k=key: self.delete_device(k)))
         self._menu = FluentMenu(self, items, e.x_root, e.y_root)
 
     def delete_device(self, key: str):
@@ -4856,7 +5064,7 @@ MF_CHECKED = 0x0008
 MF_SEPARATOR = 0x0800
 TPM_RIGHTBUTTON = 0x0002
 TPM_RETURNCMD = 0x0100
-TRAY_OPEN, TRAY_REFRESH, TRAY_STARTUP, TRAY_QUIT = 1, 2, 3, 4
+TRAY_OPEN, TRAY_REFRESH, TRAY_STARTUP, TRAY_QUIT, TRAY_BT = 1, 2, 3, 4, 5
 
 
 def allow_dark_menus() -> None:
@@ -5021,6 +5229,9 @@ class Tray:
             user32.AppendMenuW(menu, MF_STRING, TRAY_REFRESH, "立即刷新")
             user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
             user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if
+                               load_config().get("bluetooth", True) else 0),
+                               TRAY_BT, "显示蓝牙设备电量")
+            user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if
                                startup_enabled() else 0),
                                TRAY_STARTUP, "开机自启")
             user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
@@ -5172,6 +5383,14 @@ class TrayApp:
             self.refresh()
         elif cmd == TRAY_STARTUP:
             self.panel._toggle_startup()
+        elif cmd == TRAY_BT:
+            cfg = load_config()
+            on = not cfg.get("bluetooth", True)
+            cfg["bluetooth"] = on
+            if on:
+                cfg["bt_hidden"] = []  # 重新打开时把单独隐藏的也恢复
+            save_config(cfg)
+            self.refresh()
         elif cmd == TRAY_QUIT:
             self.quit()
 
@@ -5246,6 +5465,18 @@ class TrayApp:
         self.refresh()
 
     def remove_device(self, key: str):
+        if key.startswith("bt_"):
+            # 蓝牙设备不是手动添加的，“删除”就是不再显示
+            cfg = load_config()
+            hidden = list(cfg.get("bt_hidden") or [])
+            if key not in hidden:
+                hidden.append(key)
+            cfg["bt_hidden"] = hidden
+            save_config(cfg)
+            with self._lock:
+                self._readings.pop(key, None)
+            self.refresh()
+            return
         removed = next((d for d in self.devices
                         if device_key(d["vid"], d["pid"]) == key), None)
         self.devices = [d for d in self.devices

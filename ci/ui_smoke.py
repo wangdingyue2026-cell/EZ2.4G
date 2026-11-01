@@ -42,6 +42,9 @@ SNAP = {
                  detail="上次更新 20:45 · 设备休眠", vid=1, pid=2),
     "d": reading(ok=False, name="未知接收器 1A2B:3C4D",
                  status="unknown_proto", vid=0x1A2B, pid=0x3C4D),
+    "bt_001a7dda7113": reading(ok=True, level=45, name="WH-1000XM5",
+                               status="bluetooth", detail="已连接",
+                               kind="bluetooth"),
 }
 
 

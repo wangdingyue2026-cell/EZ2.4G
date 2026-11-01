@@ -22,6 +22,9 @@ jobs:
       - name: Protocol tests (synthetic captures, fake HID device)
         run: python ci/test_protocol.py my_devices.py
 
+      - name: Bluetooth tests (offline + real Windows API call)
+        run: python ci/test_bluetooth.py my_devices.py
+
       - name: UI smoke test (render every window and screenshot it)
         run: python ci/ui_smoke.py my_devices.py screenshots
 
