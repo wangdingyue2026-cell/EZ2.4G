@@ -282,14 +282,23 @@ def format_reports_handles_synthetic():
     assert "len=2" in text and "06 01 00 4B" in text, text
 
 
-# -- 内置厂商协议 ------------------------------------------------------------------
-def hid(path, vid, pid, page, inp=0, out=0, feat=0):
-    return md.HidIface(path=path, vid=vid, pid=pid, usage_page=page, usage=1,
-                       input_len=inp, output_len=out, feature_len=feat)
+# -- 内置设备适配器 ----------------------------------------------------------------
+def hid(path, vid, pid, page, inp=0, out=0, feat=0, usage=1, product=""):
+    return md.HidIface(path=path, vid=vid, pid=pid, usage_page=page,
+                       usage=usage, input_len=inp, output_len=out,
+                       feature_len=feat, product=product)
 
 
-def preset(name_part):
-    return next(p for p in md.VENDOR_PRESETS if name_part in p["name"])
+def spec(sid):
+    return next(s for s in md.DEVICE_SPECS if s["id"] == sid)
+
+
+def H(s):
+    return bytes.fromhex(s.replace(" ", ""))
+
+
+def claimed(ifaces):
+    return [a.id for a in md.adapters_for(ifaces)]
 
 
 def jl_reply(payload):
@@ -297,95 +306,274 @@ def jl_reply(payload):
     f[1], f[3], f[5] = 0xFE, 0x10, 0x02
     f[8] = len(payload)
     f[10:10 + len(payload)] = payload
-    crc = 0xFFFF
-    for b in f[1:10 + len(payload)]:
-        crc ^= b << 8
-        for _ in range(8):
-            crc = (((crc << 1) ^ 0x1021) if crc & 0x8000 else crc << 1) & 0xFFFF
-    f[10 + len(payload)], f[11 + len(payload)] = crc >> 8, crc & 0xFF
     return bytes(f)
 
 
-@case
-def preset_atk_v2():
-    """ATK 协议 2：只认 08 72 .. 07 特征的回复，别的报告里的数字不采信。"""
-    SCRIPTS["m"] = {"input": [pad((0x08, 0x10, 0, 0, 0, 0, 0, 55), 64),
-                              pad((0x08, 0x72, 2, 0, 1, 7, 1, 83), 64)]}
-    r = md._read_user_protocol([hid("m", 0x373B, 0x1216, 0xFF05, 64, 64)],
-                               preset("ATK / VXE 无线鼠标"))
-    assert r and r.level == 83 and "内置协议" in r.source, r
-    assert FakeDev.log == [("write", pad(bytes.fromhex("087D720200010701"),
-                                         64))], FakeDev.log
-
-
-@case
-def preset_darkrim_crc():
-    """DARKRIM：查询帧 CRC 与原仓库一致，回复里 TLV 0x01 是电量。"""
-    p = preset("DARKRIM")
-    assert p["requests"][0].endswith("01 00 58 09"), p["requests"]
-    SCRIPTS["h"] = {"input": [jl_reply(b"\x02\x03ABC"),
-                              jl_reply(b"\x01\x01\x46")]}
-    r = md._read_user_protocol([hid("h", 0x3654, 0x6901, 0xFF02, 65, 65)], p)
-    assert r and r.level == 70, r
-
-
-@case
-def preset_vaxee_scale():
-    """VAXEE 以 5% 为一档：原始值 ×5，超过 20 的原始值不采信。"""
-    p = preset("VAXEE")
-    SCRIPTS["v"] = {"feature": [pad((0x0E, 0, 0, 0, 0, 40), 64),
-                                pad((0x0E, 0, 0, 0, 0, 17), 64)]}
-    r = md._read_user_protocol([hid("v", 0x3057, 1, 0xFF05, feat=64)], p)
-    assert r and r.level == 85, r
-    assert FakeDev.log[0] == ("set_feat", pad(bytes.fromhex("0EA50B0101"), 64))
-
-
-@case
-def preset_endgame_busy_then_ok():
-    """Endgame：第 1 字节 0x03（忙）的回复不采信，继续等到 0x01（有效）。"""
-    p = dict(preset("Endgame"), wait_ms=0)
-    busy = pad((0xA1, 0x03) + (0,) * 14 + (99,), 64)
-    ok = pad((0xA1, 0x01) + (0,) * 14 + (64,), 64)
-    SCRIPTS["e"] = {"feature": [busy, ok]}
-    r = md._read_user_protocol([hid("e", 0x3367, 1, 0xFF01, feat=64)], p)
-    assert r and r.level == 64, r
-
-
-@case
-def preset_skips_other_interfaces():
-    """只往协议指定的厂商接口发请求，不碰同一设备的其它接口。"""
-    p = dict(preset("Nordic"), tries=1, timeout_ms=100)
-    SCRIPTS["k"] = {}
-    SCRIPTS["n"] = {"feature": [pad((0x05,) + (0,) * 8 + (77,), 32)]}
-    r = md._read_user_protocol([hid("k", 0x1915, 1, 0xFF00, feat=32),
-                                hid("n", 0x1915, 1, 0xFFA0, feat=32)], p)
-    assert r and r.level == 77, r
-    assert all(e[0] != "set_feat" or len(e[1]) == 32 for e in FakeDev.log)
-    assert len([e for e in FakeDev.log if e[0] == "set_feat"]) == 1
-
-
-@case
-def preset_auto_detect_saves():
-    """没有协议的设备按 VID 命中内置协议，读到后保存，下次直接用。"""
-    store = {}
+def memory_config(store):
     md.load_config = lambda: json.loads(json.dumps(store))
     md.save_config = lambda cfg: (store.clear(), store.update(cfg))
+
+
+@case
+def compx_frame_and_real_replies():
+    """ATK / IMECOO 17 字节：查询帧校验和 0x49；两条真机回复都能解析（含毫伏和校验）。"""
+    f = md.build_spec_frames(spec("compx17"))[0]
+    assert f == H("08 04" + " 00" * 14 + " 49"), f.hex(" ")
+    atk = H("08 04 00 00 00 02 64 00 10 DD 00 00 00 00 00 00 F6")
+    imecoo = H("08 04 00 00 00 02 1E 00 0E 5A 00 00 00 00 00 00 C1")
+    assert md.parse_spec_reply(spec("compx17"), atk) == (100, "discharging", 4317)
+    assert md.parse_spec_reply(spec("compx17"), imecoo) == (30, "discharging", 3674)
+    bad = bytearray(atk)
+    bad[16] ^= 1
+    assert md.parse_spec_reply(spec("compx17"), bytes(bad)) is None   # 校验不对
+    rejected = bytearray(imecoo)
+    rejected[2], rejected[16] = 1, (rejected[16] - 1) & 0xFF
+    assert md.parse_spec_reply(spec("compx17"), bytes(rejected)) is None
+
+
+@case
+def compx_read_uses_set_report_first():
+    """ATK A9 拒收 WriteFile，先走 SET_REPORT；回复前混一条别的报告不采信。"""
+    SCRIPTS["a9"] = {"input": [H("08 05" + " 00" * 15),
+                               H("08 04 00 00 00 02 50 01 10 00" + " 00" * 6 + " 00")]}
+    rep = bytearray(SCRIPTS["a9"]["input"][1])
+    rep[16] = (0x4D - sum(rep[1:16])) & 0xFF
+    SCRIPTS["a9"]["input"][1] = bytes(rep)
+    ifs = [hid("a9", 0x373B, 0x1278, 0xFF02, 17, 17)]
+    a = next(x for x in md.adapters_for(ifs) if x.id == "compx17")
+    r = a.read(ifs)
+    assert r.ok and r.level == 80 and r.status == "charging", r
+    assert FakeDev.log[0][0] == "set_out", FakeDev.log
+    assert a.model_name(ifs) == "ATK A9 Air 大师+"
+
+
+@case
+def shared_vid_3554_isolation():
+    """3554 是 CompX 共用号段：迈从键盘 20/20 只归迈从；VGN 17/17、未知 PID 谁都不认领。"""
+    mchose = [hid("k", 0x3554, 0xFA09, 0xFF02, 20, 20)]
+    vgn = [hid("v", 0x3554, 0xF503, 0xFF02, 17, 17)]
+    other = [hid("o", 0x3554, 0x1234, 0xFF02, 33, 33)]
+    assert claimed(mchose) == ["mchose20"], claimed(mchose)
+    assert claimed(vgn) == [], claimed(vgn)
+    assert claimed(other) == [], claimed(other)
+    assert claimed([hid("i", 0x3554, 0xFB34, 0xFF02, 17, 17)]) == ["compx17"]
+
+
+@case
+def mchose_frame_and_reply():
+    f = md.build_spec_frames(spec("mchose20"))[0]
+    assert len(f) == 20 and f[:4] == H("13 4A 01 00") and f[19] == 0x5E, f.hex(" ")
+    rep = bytearray(20)
+    rep[:7] = H("13 4A 01 00 02 64 01")
+    rep[19] = sum(rep[:19]) & 0xFF
+    assert rep[19] == 0xC5                              # Voltide 的真机样本
+    assert md.parse_spec_reply(spec("mchose20"), bytes(rep)) == (100, "discharging", None)
+    rep[6] = 0x10
+    rep[19] = sum(rep[:19]) & 0xFF
+    assert md.parse_spec_reply(spec("mchose20"), bytes(rep))[1] == "charging"
+
+
+@case
+def single_frame_specs_parse_real_samples():
+    cases = {
+        "rog_omni": (H("02 12 01 00 00 00 30 02 01 00 14 30 ED 0E"), 48),
+        "atk_n9": (H("55 65 64 02 02 00 00 04"), 100),
+        "atk64": (H("08 72 02 00 01 07 01 4B"), 75),
+        "inphic_in10": (H("03 98 40 01 64"), 100),
+        "darkrim": (jl_reply(b"\x01\x01\x46"), 70),
+    }
+    for sid, (rep, want) in cases.items():
+        got = md.parse_spec_reply(spec(sid), rep)
+        assert got and got[0] == want, (sid, got)
+    full = md.parse_spec_reply(spec("atk_n9"), H("55 65 5A 04"))
+    assert full == (100, "full", None), full
+    bs = bytearray(64)
+    bs[:4] = H("02 0E 50 49")
+    bs[12:16] = H("21 01 01 4B")
+    assert md.parse_spec_reply(spec("razer_bs"), bytes(bs))[0] == 75
+    assert md.parse_spec_reply(spec("darkrim"), jl_reply(b"\x02\x03ABC")) is None
+
+
+@case
+def inphic_in10_is_listen_only():
+    """IN10 只听不写：只打开读句柄，等鼠标自己每 2 秒推的电量帧。"""
+    SCRIPTS["in10"] = {"input": [H("03 98 20 01 00"), H("03 98 40 01 3C")]}
+    ifs = [hid("in10", 0x045E, 0x0098, 0x000A, 5)]
+    assert claimed(ifs) == ["inphic_in10"]
+    assert claimed([hid("ms", 0x045E, 0x0040, 0x000A, 5)]) == []   # 别的微软设备
+    a = md.adapters_for(ifs)[0]
+    r = a.read(ifs)
+    assert r.ok and r.level == 60, r
+    assert FakeDev.log == [], FakeDev.log
+
+
+@case
+def inphic_in9_handshake_then_query():
+    s = spec("inphic_in9")
+    rep = bytearray(33)
+    rep[0], rep[1], rep[2], rep[6], rep[0x12], rep[0x13] = 0x0C, 1, 0x20, 1, 77, 2
+    SCRIPTS["in9"] = {"feature": [bytes(rep)]}
+    ifs = [hid("in9", 0x248A, 0x5B2F, 0xFF00, feat=33)]
+    r = md.adapters_for(ifs)[0].read(ifs)
+    assert r.ok and r.level == 77 and r.status == "charging", r
+    sent = [e[1][:3] for e in FakeDev.log if e[0] == "set_feat"]
+    assert sent == [H("0C 01 F0"), H("0C 01 20")], FakeDev.log
+    assert claimed([hid("x", 0x248A, 0x1111, 0xFF00, feat=33)]) == []
+
+
+@case
+def rapoo_and_acer_and_vaxee():
+    rap = bytearray(19)
+    rap[0], rap[7], rap[8] = 0x07, 0x02, 85
+    assert md.parse_spec_reply(spec("rapoo"), bytes(rap)) == (85, "charging", None)
+    acer = bytearray(33)
+    acer[1], acer[3], acer[14] = 0x10, 0x01, 64
+    assert md.parse_spec_reply(spec("acer_omr"), bytes(acer))[0] == 64
+    vx = bytearray(64)
+    vx[:6] = H("0E A5 0B 00 00 11")
+    assert md.parse_spec_reply(spec("vaxee"), bytes(vx))[0] == 85
+    vx[5] = 30                                          # 超过 20 档：不采信
+    assert md.parse_spec_reply(spec("vaxee"), bytes(vx)) is None
+
+
+@case
+def pixart_finds_reply_after_wait_frames():
+    rep = bytearray(65)
+    rep[1:9] = H("A1 00 02 02 00 83 01 2D")
+    assert md.parse_spec_reply(spec("pixart83"), H("00 A0" + " 00" * 10)) is None
+    assert md.parse_spec_reply(spec("pixart83"), bytes(rep)) == (45, "charging", None)
+
+
+@case
+def logitech_hidpp_unified_battery():
+    """GPW3 真机抓包：0x1000 不存在 → 0x1004 功能 1，回复 11 01 06 1E 61 08 00 = 97%。"""
+    ping = pad(H("11 01 00 1E 04 02 5A"), 20)
+    no_1000 = pad(H("11 01 00 0E 00"), 20)
+    has_1004 = pad(H("11 01 00 0E 06"), 20)
+    status = pad(H("11 01 06 1E 61 08 00"), 20)
+    noise = pad(H("11 01 04 00 01 02 03"), 20)
+    SCRIPTS["logi"] = {"input": [ping, no_1000, noise, has_1004, status]}
+    ifs = [hid("logi", 0x046D, 0xC547, 0xFF00, 20, 20, usage=2,
+               product="USB Receiver")]
+    assert claimed(ifs) == ["logitech"]
+    r = md.adapters_for(ifs)[0].read(ifs)
+    assert r.ok and r.level == 97 and r.status == "discharging", r
+    writes = [e[1][:4] for e in FakeDev.log if e[0] == "write"]
+    assert writes[0] == H("11 01 00 1E") and writes[-1] == H("11 01 06 1E"), writes
+    wired = [hid("w", 0x046D, 0xC08B, 0xFF00, 20, 20, usage=2,
+                 product="G502 HERO Gaming Mouse")]
+    assert claimed(wired) == []                         # 有线设备不认领
+
+
+@case
+def razer_scales_raw_and_reads_charging():
+    """雷蛇电量 0–255 一律换算（132 → 52%），充电走 0x84。"""
+    def reply(tx, val):
+        b = bytearray(91)
+        b[1], b[2], b[6], b[10] = 2, tx, 2, val
+        return bytes(b)
+    SCRIPTS["rz"] = {"feature": [reply(0x20, 132), reply(0x30, 1)]}
+    ifs = [hid("rz", 0x1532, 0x007B, 0x0001, feat=91)]
+    r = md.adapters_for(ifs)[0].read(ifs)
+    assert r.ok and r.level == 52 and r.status == "charging", r
+    req = FakeDev.log[0][1]
+    assert req[7:9] == H("07 80") and req[89] == req[3] ^ req[6] ^ 0x07 ^ 0x80 ^ 0
+    crc = 0
+    for v in req[3:89]:
+        crc ^= v
+    assert req[89] == crc
+    assert claimed([hid("rk", 0x1532, 0x0999, 0x0001, feat=91)]) == []
+
+
+@case
+def unknown_device_gets_no_writes():
+    """没有适配器认领的设备：不发任何帧，显示“协议未知”。"""
+    store = {}
+    memory_config(store)
     md.read_standard_battery = lambda d: None
-    SCRIPTS["m"] = {"input": [pad((0x08, 0x72, 2, 0, 1, 7, 1, 50), 64)]}
-    ifs = [hid("m", 0x373B, 0x1216, 0xFF05, 64, 64)]
-    r = md.read_saved_device({"vid": 0x373B, "pid": 0x1216, "name": ""}, ifs)
-    assert r.ok and r.level == 50, r
-    saved = store["protocols"]["373B:1216"]
-    assert saved["kind"] == "preset" and saved["usage_page"] == 0xFF05, saved
-    SCRIPTS["m"] = {"input": []}
-    r = md.read_saved_device({"vid": 0x373B, "pid": 0x1216, "name": ""}, ifs)
-    assert r.status == "asleep" and "内置协议" in r.source, r
-    # 不认识的 VID 不发任何请求，仍是“协议未知”
-    FakeDev.log = []
-    SCRIPTS["x"] = {}
+    SCRIPTS["u"] = {}
     r = md.read_saved_device({"vid": 0x1234, "pid": 1, "name": ""},
-                             [hid("x", 0x1234, 1, 0xFF05, 64, 64)])
+                             [hid("u", 0x1234, 1, 0xFF00, 64, 64)])
     assert r.status == "unknown_proto" and FakeDev.log == [], (r, FakeDev.log)
+
+
+@case
+def adapter_reading_and_sleep_in_read_saved_device():
+    store = {}
+    memory_config(store)
+    md.read_standard_battery = lambda d: None
+    rep = bytearray(H("08 04 00 00 00 02 2D 00 0F A0" + " 00" * 7))
+    rep[16] = (0x4D - sum(rep[1:16])) & 0xFF
+    SCRIPTS["m"] = {"input": [bytes(rep)]}
+    ifs = [hid("m", 0x373B, 0x11D9, 0xFF02, 17, 17)]
+    dev = {"vid": 0x373B, "pid": 0x11D9, "name": ""}
+    r = md.read_saved_device(dev, ifs)
+    assert r.ok and r.level == 45 and r.source == "ATK 协议", r
+    assert "protocols" not in store                     # 适配器不往配置里存协议
+    SCRIPTS["m"] = {"input": []}
+    r = md.read_saved_device(dev, ifs)
+    assert r.status == "asleep" and r.source == "ATK 协议", r
+    r = md.read_saved_device(dev, [])
+    assert r.status == "unplugged", r
+
+
+@case
+def legacy_preset_is_fallback_only():
+    """旧版自动保存的 preset 协议：有适配器时先用适配器，读不到才回退。"""
+    store = {"protocols": {"373B:1216": {
+        "kind": "preset", "v": 2, "requests": ["08 7D 72 02 00 01 07 01"],
+        "req_kinds": ["out"], "offset": 7, "reply": "input",
+        "match": [[0, 8], [1, 0x72], [5, 7]], "tries": 1, "timeout_ms": 100}}}
+    memory_config(store)
+    md.read_standard_battery = lambda d: None
+    SCRIPTS["p"] = {"input": [pad(H("08 72 02 00 01 07 01 3C"), 64)]}
+    ifs = [hid("p", 0x373B, 0x1216, 0xFF05, 64, 64)]
+    r = md.read_saved_device({"vid": 0x373B, "pid": 0x1216, "name": ""}, ifs)
+    assert r.ok and r.level == 60 and r.source == "ATK 协议", r
+
+
+# -- 导入设备规格（声明式适配器，带真机样本） ----------------------------------------
+GOOD_SPEC = {"name": "示例 鼠标", "kind": "mouse", "ids": [["ABCD", "0001"]],
+             "page": "0xFF02", "lens": {"in": 17, "out": 17},
+             "send": ["setout"], "frames": ["08 04"],
+             "csum": {"kind": "const", "const": 77, "from": 1, "to": 15, "at": 16},
+             "reply": "input", "expect": [[0, 8], [1, 4]], "level": [6],
+             "sample": "08 04 00 00 00 02 50 00 00 00 00 00 00 00 00 00 25"}
+
+
+@case
+def spec_import_requires_working_sample():
+    store = {}
+    memory_config(store)
+    got = md.import_protocols(json.dumps({"specs": [GOOD_SPEC]}))
+    assert list(got) == ["spec:示例 鼠标"], got
+    assert store["specs"][0]["ids"] == [["ABCD", "0001"]], store
+    ifs = [hid("s", 0xABCD, 0x0001, 0xFF02, 17, 17)]
+    assert claimed(ifs)[0] == "user:示例 鼠标", claimed(ifs)
+    assert md.adapter_knows(0xABCD, 0x0001)
+    for patch, why in ((dict(sample="08 04 00 00 00 02 FF"), "sample"),
+                       (dict(ids=[["ABCD", None]]), "PID"),
+                       (dict(expect=[]), "expect"),
+                       (dict(send=["poke"]), "send"),
+                       (dict(sample=""), "sample")):
+        bad = dict(GOOD_SPEC, **patch)
+        try:
+            md.parse_import(json.dumps({"specs": [bad]}))
+            raise AssertionError(patch)
+        except ValueError as e:
+            assert why in str(e), (patch, str(e))
+
+
+@case
+def device_info_and_xinput():
+    store = {}
+    memory_config(store)
+    r = md.Reading(ok=True, level=45, name="ATK F1", source="ATK 协议",
+                   raw=H("08 04 00"))
+    r.vid, r.pid = 0x373B, 0x11D9
+    text = md.device_info_text(r, [hid("m", 0x373B, 0x11D9, 0xFF02, 17, 17)])
+    assert "373B:11D9" in text and "ATK 无线鼠标" in text and "08 04 00" in text, text
+    assert md.read_xinput_all() == {}                   # 非 Windows 下不读
 
 
 # -- 导入 / 导出协议 ----------------------------------------------------------------

@@ -348,6 +348,13 @@ class HidDevice:
         if not self.h or self.h == INVALID_HANDLE_VALUE:
             err = ctypes.get_last_error()
             if write:
+                # 鼠标 / 键盘集合拒绝读权限（如雷蛇接收器），只要写权限仍能收发 Feature
+                self.h = _open_path(path, GENERIC_WRITE)
+                if self.h and self.h != INVALID_HANDLE_VALUE:
+                    self.rh = _open_path(path, GENERIC_READ, overlapped=True)
+                    if not self.rh or self.rh == INVALID_HANDLE_VALUE:
+                        self.rh = 0
+                    return
                 self.h = _open_path(path, 0)
             if not self.h or self.h == INVALID_HANDLE_VALUE:
                 raise HidError(f"打开接口失败（错误码 {err}）")
@@ -718,6 +725,68 @@ def read_bluetooth_all() -> dict[str, Reading]:
 
 
 # ===========================================================================
+# Xbox 兼容手柄（XInput）：Xbox 模式的手柄没有厂商 HID 通道，只能问 XInput。
+# XInputGetBatteryInformation 只给四档（满 / 中 / 低 / 空），按档位中间值显示并注明。
+# 参考 Voltide 的 XInputProvider。
+# ===========================================================================
+_XINPUT = None
+XINPUT_LEVEL = {3: 100, 2: 50, 1: 20, 0: 5}
+
+
+def _xinput():
+    global _XINPUT
+    if _XINPUT is None:
+        _XINPUT = False
+        for name in ("XInput1_4", "XInput1_3", "XInput9_1_0"):
+            try:
+                _XINPUT = ctypes.WinDLL(name)
+                break
+            except OSError:
+                continue
+    return _XINPUT or None
+
+
+def read_xinput_all() -> dict[str, Reading]:
+    if sys.platform != "win32":
+        return {}
+    dll = _xinput()
+    if dll is None:
+        return {}
+    hidden = set(load_config().get("bt_hidden") or [])
+    names = custom_names()
+    out = {}
+    for slot in range(4):
+        key = f"xi_{slot}"
+        if key in hidden:
+            continue
+        state = ctypes.create_string_buffer(16)
+        try:
+            if dll.XInputGetState(slot, state) != 0:
+                continue
+            info = ctypes.create_string_buffer(2)
+            if dll.XInputGetBatteryInformation(slot, 0, info) != 0:
+                continue
+        except Exception:
+            continue
+        btype, blevel = info.raw[0], info.raw[1]
+        if btype == 0:                      # 已断开
+            continue
+        name = names.get(key) or f"Xbox 手柄 {slot + 1}"
+        if btype == 1:                      # 有线：插着线就当充电
+            r = Reading(ok=True, level=100, status="charging",
+                        source="XInput", detail="XInput 有线")
+        elif blevel in XINPUT_LEVEL:
+            r = Reading(ok=True, level=XINPUT_LEVEL[blevel],
+                        status="discharging", source="XInput",
+                        detail="XInput 四档，约值")
+        else:
+            continue
+        r.name, r.kind = name, "gamepad"
+        out[key] = r
+    return out
+
+
+# ===========================================================================
 # CPU / GPU 温度
 #   GPU：D3DKMT 适配器性能数据（任务管理器同源，WDDM 2.7+ 驱动，无需管理员）
 #   CPU：LibreHardwareMonitor / OpenHardwareMonitor 在运行时读它们的传感器（准确）；
@@ -1058,14 +1127,15 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
     if not cand:
         return Reading(ok=False, present=False,
                        name=name or f"{vid:04X}:{pid:04X}",
-                       status=("unplugged" if has_device_protocol(vid, pid)
+                       status=("unplugged" if (has_device_protocol(vid, pid)
+                                               or adapter_knows(vid, pid))
                                else "unknown_proto"),
                        vid=vid, pid=pid, detail="未连接")
     prod = next((d.product for d in cand if d.product), "")
     if not name:
         name = prod or f"{vid:04X}:{pid:04X}"
-    # 三条路：标准 HID 直接读、已保存的协议（抓包 / 导入 / 内置），
-    # 都没有时按 VID + 厂商接口试一次内置厂商协议，读到才保存。
+    # 读取顺序：标准 HID 电量 → 用户保存的协议（抓包 / 导入）→ 内置设备适配器。
+    # 旧版自动保存的 "preset" 协议只作最后的兜底，有适配器认领时以适配器为准。
     r = None
     for d in cand:
         try:
@@ -1077,35 +1147,43 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
             break
     key = f"{vid:04X}:{pid:04X}"
     proto = user_protocols().get(key)
-    if not r or not r.ok:
-        if proto is not None and proto.get("kind", "captured") != "standard":
+    kind = proto.get("kind", "captured") if proto else None
+    adapter = ar = None
+    if r is not None:
+        if proto is None:
+            # 标准 HID 能直接读：保存成协议，之后休眠也算“有协议”
+            save_standard_protocol(vid, pid)
+            proto = {"kind": "standard"}
+    else:
+        if kind in ("captured",):
             try:
                 rr = _read_user_protocol(cand, proto)
                 if rr and rr.ok:
                     r = rr
             except Exception:
                 pass
-        elif proto is None:
-            rr, preset = read_vendor_preset(vid, cand)
-            if rr is not None:
-                r = rr
-                save_user_protocol(vid, pid, preset, kind="preset")
-                proto = user_protocols().get(key)
-    elif proto is None:
-        # 标准 HID 能直接读：保存成协议，之后休眠也算“有协议”
-        save_standard_protocol(vid, pid)
-    supported = key in user_protocols()
-    if r is None:
+        if r is None:
+            ar, adapter = read_by_adapters(cand)
+            if ar is not None and ar.ok:
+                r = ar
+        if r is None and kind == "preset":
+            try:
+                rr = _read_user_protocol(cand, proto)
+                if rr and rr.ok:
+                    r = rr
+            except Exception:
+                pass
+    supported = proto is not None or adapter is not None
+    src = (adapter and f"{adapter.brand} 协议") or protocol_source(proto)
+    if r is None or not r.ok:
+        err = ar.detail if (ar is not None and ar.status != "asleep") else ""
         r = Reading(
             ok=False, present=True, name=name,
-            status="asleep" if supported else "unknown_proto",
-            source=protocol_source(proto) if supported else "",
-            detail=("设备休眠" if supported
-                    else "协议未知，无法读取电量"))
-    elif not r.ok and supported:
-        r.status = "asleep"
-        r.source = protocol_source(proto)
-        r.detail = "设备休眠"
+            status=("error" if err else "asleep") if supported
+            else "unknown_proto",
+            source=src if supported else "",
+            detail=err or ("设备休眠" if supported
+                           else "协议未知，无法读取电量"))
     r.name = name
     r.present = True
     meta = next((d for d in cand if d.usage_page >= 0xFF00), cand[0])
@@ -1711,9 +1789,15 @@ def save_user_protocol(vid: int, pid: int, proto: dict,
 
 
 # ---------------------------------------------------------------------------
-# 内置厂商协议：按 VID + 厂商接口（usage page）识别，读到电量后才保存为该设备的协议。
-# 来源：yszyszysz233/2.4G-battery-viewer 的厂商协议表（ATK 协议 2、DARKRIM 已真机验证，
-# 其余来自公开协议文档）。偏移都从 Windows 缓冲区第 0 字节（报告 ID）算起。
+# 内置设备适配器：每个品牌一个“适配器”，按精确的硬件指纹（VID / PID / usage page /
+# 报告长度）认领设备，只发有出处的查询帧，回复必须对上回显和校验才采信。
+#
+# 方法与协议来源（都是 MIT 项目，或只取协议事实、自行实现）：
+#   Voltide（sdparklab）          适配器架构；罗技、迈从、ROG、雷蛇、ATK、IMECOO、XInput
+#   InphicBatteryTray（Tan-TanZi） 英菲克 IN10 被动上报、IN9 Feature 查询
+#   FerrisPulse（Ferris-echo，GPL） 只参考协议文档：CompX 同号段隔离、雷柏遥测、宏碁、PixArt 引擎
+#   VigilWatt / HaloBattery       写入安全规则、共用 VID 陷阱、交叉核对
+#   2.4G-battery-viewer           ATK 64 字节协议、DARKRIM 杰理协议
 # ---------------------------------------------------------------------------
 def _jl_query(tlv: int) -> str:
     """杰理 JL_RCSP 查询帧（序号 0、TLV 长度 0），CRC16-CCITT-FALSE 大端。"""
@@ -1729,59 +1813,595 @@ def _jl_query(tlv: int) -> str:
     return " ".join(f"{b:02X}" for b in f)
 
 
-_ATK_V1 = "08 04" + " 00" * 15 + " 49"
-
-VENDOR_PRESETS = [
-    {"name": "ATK / VXE 无线鼠标", "vid": 0x373B, "usage_page": 0xFF05,
-     "requests": ["08 7D 72 02 00 01 07 01"], "req_kinds": ["out"],
-     "out_len": 64, "reply": "input", "in_len": 64, "offset": 7,
-     "match": [[0, 0x08], [1, 0x72], [5, 0x07]]},
-    {"name": "ATK / VXE / VGN 无线鼠标", "vid": 0x373B, "usage_page": 0xFF02,
-     "requests": [_ATK_V1], "req_kinds": ["out"], "out_len": 17,
-     "reply": "input", "in_len": 17, "offset": 6, "match": [[0, 0x08]]},
-    {"name": "VXE / VGN 无线鼠标", "vid": 0x3554, "usage_page": 0xFF02,
-     "requests": [_ATK_V1], "req_kinds": ["out"], "out_len": 17,
-     "reply": "input", "in_len": 17, "offset": 6, "match": [[0, 0x08]]},
-    {"name": "Endgame Gear 无线鼠标", "vid": 0x3367, "usage_page": 0xFF01,
-     "requests": ["A1 B4"], "req_kinds": ["set_feat"], "reply": "feature",
-     "reply_id": 0xA1, "offset": 16, "match": [[0, 0xA1], [1, 0x01]],
-     "wait_ms": 350},
-    {"name": "VAXEE / ZYGEN 无线鼠标", "vid": 0x3057, "usage_page": 0xFF05,
-     "requests": ["0E A5 0B 01 01"], "req_kinds": ["set_feat"],
-     "reply": "feature", "reply_id": 0x0E, "offset": 5,
-     "match": [[0, 0x0E]], "scale": 5, "level_max": 20},
-    {"name": "Nordic 2.4G 接收器", "vid": 0x1915, "usage_page": 0xFFA0,
-     "requests": ["05 15 00 00 01"], "req_kinds": ["set_feat"],
-     "reply": "feature", "reply_id": 0x05, "offset": 9, "match": [[0, 0x05]]},
-    {"name": "DARKRIM 耳机", "vid": 0x3654, "usage_page": 0xFF02,
-     "requests": [_jl_query(0x01)], "req_kinds": ["out"], "out_len": 65,
-     "reply": "input", "in_len": 65, "offset": 12,
-     "match": [[1, 0xFE], [10, 0x01], [11, 0x01]]},
+# 声明式适配器（单帧问答 / 被动监听）。字段：
+#   ids     [(VID, PID 或 None)]，None = 该 VID 下任意 PID（只用于品牌独占的 VID）
+#   page / usage / lens   接口指纹；lens 里的长度默认必须相等，lens_min=True 时为下限
+#   send    发送方式，按顺序尝试：out=WriteFile，setout=SET_REPORT(Output)，
+#           feat=SET_REPORT(Feature)；空列表 = 只听不写
+#   frames  要发的帧（含报告 ID），最后一帧之后等回复；csum 给出帧内校验和算法
+#   reply   input / feature（reply_id 为 GET_FEATURE 的报告 ID）
+#   expect  回复里必须相等的 [位置, 值]；nz 必须非零的位置；find 在回复里找特征串
+#   rcsum   回复的校验和；level=[位置, 倍率, 原始上限]；charge/full=[位置, [值…]]
+#   mv      [位置, "be"/"le"] 电池毫伏（只显示）
+DEVICE_SPECS = [
+    {"id": "compx17", "brand": "ATK", "name": "ATK 无线鼠标", "kind": "mouse",
+     "names": {(0x373B, 0x1278): "ATK A9 Air 大师+",
+               (0x373B, 0x11D9): "ATK F1 Ultimate 2.0",
+               (0x3554, 0xFB34): "IMECOO P1"},
+     "ids": [(0x373B, None), (0x3554, 0xFB34)],
+     "page": 0xFF02, "lens": {"in": 17, "out": 17},
+     "send": ["setout", "out"], "frames": ["08 04"],
+     "csum": {"kind": "const", "const": 0x4D, "from": 1, "to": 15, "at": 16},
+     "reply": "input", "expect": [[0, 0x08], [1, 0x04], [2, 0x00]],
+     "rcsum": {"kind": "const", "const": 0x4D, "from": 1, "to": 15, "at": 16},
+     "level": [6], "charge": [7, [1]], "mv": [8, "be"], "timeout": 700,
+     "verified": True, "source": "Voltide（ATK A9 Air、IMECOO P1 真机）· FerrisPulse"},
+    {"id": "atk64", "brand": "ATK", "name": "ATK 无线鼠标", "kind": "mouse",
+     "ids": [(0x373B, None)], "page": 0xFF05, "lens": {"out": 64},
+     "send": ["out"], "frames": ["08 7D 72 02 00 01 07 01"],
+     "reply": "input", "expect": [[0, 0x08], [1, 0x72], [5, 0x07]],
+     "level": [7], "timeout": 600, "drain": True,
+     "verified": True, "source": "2.4G-battery-viewer（373B:1216 真机）"},
+    {"id": "atk_n9", "brand": "ATK", "name": "ATK N9 V2 Ultimate 耳机",
+     "kind": "headset", "ids": [(0x373B, 0x1262)], "page": 0xFF90,
+     "lens": {"in": 64, "out": 64}, "send": ["out"], "frames": ["55 65 01"],
+     "reply": "input", "expect": [[0, 0x55], [1, 0x65]],
+     "level": [2], "charge": [3, [0x03]], "full": [3, [0x04]],
+     "timeout": 1200, "drain": True,
+     "verified": True, "source": "Voltide（真机）"},
+    {"id": "mchose20", "brand": "MCHOSE", "name": "迈从键盘", "kind": "keyboard",
+     "names": {(0x3554, 0xFA09): "迈从 K99 V2 / G75 Pro"},
+     "ids": [(0x3554, None)], "page": 0xFF02, "lens": {"in": 20, "out": 20},
+     "send": ["setout"], "frames": ["13 4A 01 00"],
+     "csum": {"kind": "sum", "from": 0, "to": 18, "at": 19},
+     "reply": "input", "expect": [[0, 0x13], [1, 0x4A]],
+     "rcsum": {"kind": "sum", "from": 0, "to": 18, "at": 19},
+     "level": [5], "charge": [6, [0x10]], "timeout": 450, "drain": True,
+     "verified": True, "source": "Voltide（K99 V2、G75 Pro 真机）· FerrisPulse"},
+    {"id": "rog_omni", "brand": "ROG", "name": "ROG 无线键盘（OMNI 接收器）",
+     "kind": "keyboard", "ids": [(0x0B05, 0x1ACE)], "page": 0xFF00,
+     "lens": {"in": 64, "out": 64}, "lens_min": True, "send": ["out"],
+     "frames": ["02 12 01"], "reply": "input",
+     "expect": [[0, 0x02], [1, 0x12], [2, 0x01]], "level": [6],
+     "timeout": 900, "drain": True,
+     "verified": True, "source": "Voltide（AZOTH EXTREME 真机）"},
+    {"id": "razer_bs", "brand": "Razer", "name": "雷蛇旋风黑鲨 V2 Pro",
+     "kind": "headset", "ids": [(0x1532, 0x0555)], "page": 0xFF00,
+     "lens": {"in": 64, "out": 64}, "send": ["out"],
+     "frames": ["02 80 09 00 00 50 41 08 00 04 21 00 01 01"], "reply": "input",
+     "expect": [[0, 0x02], [2, 0x50], [3, 0x49], [12, 0x21], [13, 0x01],
+                [14, 0x01]], "level": [15], "timeout": 600, "drain": True,
+     "verified": True, "source": "Voltide（真机）· FerrisPulse"},
+    {"id": "darkrim", "brand": "DARKRIM", "name": "DARKRIM SHADOW 耳机",
+     "kind": "headset", "ids": [(0x3654, 0x6901)], "page": 0xFF02,
+     "lens": {"out": 65}, "send": ["out"], "frames": [_jl_query(0x01)],
+     "reply": "input", "expect": [[1, 0xFE], [10, 0x01], [11, 0x01]],
+     "level": [12], "timeout": 500, "drain": True,
+     "verified": True, "source": "2.4G-battery-viewer（真机）· VigilWatt"},
+    {"id": "inphic_in10", "brand": "Inphic", "name": "英菲克无线鼠标",
+     "kind": "mouse",
+     "ids": [(0x1D57, 0xFA60), (0x1D57, 0xFA65), (0x045E, 0x0095),
+             (0x045E, 0x0090), (0x045E, 0x0093), (0x045E, 0x0099),
+             (0x045E, 0x0098), (0x045E, 0x0273), (0x045E, 0x0271)],
+     "page": 0x000A, "send": [], "reply": "input",
+     "expect": [[0, 0x03], [2, 0x40]], "level": [4], "timeout": 2600,
+     "verified": True,
+     "source": "InphicBatteryTray（鼠标每 2 秒主动上报，零写入）· VigilWatt"},
+    {"id": "inphic_in9", "brand": "Inphic", "name": "英菲克 IN9 无线鼠标",
+     "kind": "mouse", "ids": [(0x248A, 0x5B2E), (0x248A, 0x5B2F)],
+     "lens": {"feat": 33}, "lens_min": True, "send": ["feat"],
+     "frames": ["0C 01 F0 00 01 01 01 FF", "0C 01 20 00 01 00 00"],
+     "reply": "feature", "reply_id": 0x0C,
+     "expect": [[0, 0x0C], [2, 0x20]], "nz": [6], "level": [0x12],
+     "charge": [0x13, [2]], "timeout": 400,
+     "verified": True, "source": "InphicBatteryTray / InphicBatteryTray-IN9（真机）"},
+    {"id": "rapoo", "brand": "Rapoo", "name": "雷柏无线鼠标", "kind": "mouse",
+     "ids": [(0x24AE, None)], "page": 0xFF00, "usage": 0x0002,
+     "lens": {"in": 19}, "send": [], "reply": "input", "expect": [[0, 0x07]],
+     "level": [8], "charge": [7, [0x02]], "timeout": 2500,
+     "verified": True,
+     "source": "FerrisPulse 文档 · VigilWatt（VT3 二代真机）· rapoo-tray，零写入"},
+    {"id": "acer_omr", "brand": "Acer", "name": "宏碁 OMR 无线鼠标",
+     "kind": "mouse",
+     "ids": [(0x249A, 0x5C2F), (0x248A, 0x5D2E), (0x248A, 0x5E2E)],
+     "page": 0xFF01, "usage": 0x0010, "lens": {"in": 33, "out": 33},
+     "send": ["out"], "frames": ["00 10"], "reply": "input",
+     "expect": [[0, 0x00], [1, 0x10], [3, 0x01]], "level": [14],
+     "timeout": 600, "drain": True,
+     "verified": True, "source": "FerrisPulse 文档（OMR331 贡献者真机）"},
+    {"id": "vaxee", "brand": "VAXEE", "name": "VAXEE 无线鼠标", "kind": "mouse",
+     "ids": [(0x3057, None)], "page": 0xFF05, "lens": {"feat": 64},
+     "send": ["feat"], "frames": ["0E A5 0B 01 01"], "reply": "feature",
+     "reply_id": 0x0E, "expect": [[0, 0x0E], [1, 0xA5], [2, 0x0B]],
+     "level": [5, 5, 20], "timeout": 300,
+     "verified": False, "source": "2.4G-battery-viewer · FerrisPulse 文档（两处一致）"},
+    {"id": "pixart83", "brand": "PixArt", "name": "无线鼠标", "kind": "mouse",
+     "names": {(0x37B0, None): "LAMZU 无线鼠标", (0x373E, None): "LAMZU 无线鼠标",
+               (0x3710, None): "Pulsar 无线鼠标", (0x36A7, None): "WLmouse 无线鼠标"},
+     "ids": [(0x37B0, None), (0x373E, None), (0x3710, None), (0x36A7, None)],
+     "page_min": 0xFF00, "lens": {"feat": 64}, "lens_min": True,
+     "send": ["feat"], "frames": ["00 00 00 02 02 00 83"], "reply": "feature",
+     "reply_id": 0x00, "find": [0xA1, 0x00, 0x02, 0x02, 0x00, 0x83],
+     "level": [7], "charge": [6, [1]], "timeout": 300,
+     "verified": False, "source": "FerrisPulse 文档 / OpenMouse 协议"},
 ]
-for _p in VENDOR_PRESETS:
-    # 厂商协议只认完全符合特征的回复；第一次请求常被当作唤醒，多试几次
-    _p.update(kind="preset", v=2, strict=True)
-    _p.setdefault("tries", 3)
-    _p.setdefault("timeout_ms", 600)
-del _p
 
 
-def vendor_presets_for(vid: int, ifaces: list) -> list:
-    pages = {d.usage_page for d in ifaces}
-    return [p for p in VENDOR_PRESETS
-            if p["vid"] == vid and p["usage_page"] in pages]
+def _csum(buf: bytearray, c: dict) -> int:
+    s = sum(buf[c["from"]:c["to"] + 1])
+    if c["kind"] == "const":
+        return (c["const"] - s) & 0xFF
+    return s & 0xFF
 
 
-def read_vendor_preset(vid: int, ifaces: list):
-    """按内置厂商协议试读一次：返回 (读数, 协议) 或 (None, None)。"""
-    for p in vendor_presets_for(vid, ifaces):
+def _spec_ids_match(spec: dict, vid: int, pid: int) -> bool:
+    return any(v == vid and (p is None or p == pid) for v, p in spec["ids"])
+
+
+def _spec_iface_ok(spec: dict, d) -> bool:
+    if not _spec_ids_match(spec, d.vid, d.pid):
+        return False
+    if "page" in spec and d.usage_page != spec["page"]:
+        return False
+    if "page_min" in spec and d.usage_page < spec["page_min"]:
+        return False
+    if "usage" in spec and d.usage != spec["usage"]:
+        return False
+    have = {"in": d.input_len, "out": d.output_len, "feat": d.feature_len}
+    for k, n in spec.get("lens", {}).items():
+        if (have[k] < n) if spec.get("lens_min") else (have[k] != n):
+            return False
+    return True
+
+
+def parse_spec_reply(spec: dict, rep: Optional[bytes]):
+    """按规格解析一条回复：返回 (电量, 状态, 毫伏) 或 None。"""
+    if not rep:
+        return None
+    base = 0
+    pat = spec.get("find")
+    if pat:
+        n = len(pat)
+        base = next((i for i in range(len(rep) - n + 1)
+                     if list(rep[i:i + n]) == list(pat)), -1)
+        if base < 0:
+            return None
+    for pos, val in spec.get("expect", []):
+        if len(rep) <= base + pos or rep[base + pos] != val:
+            return None
+    for pos in spec.get("nz", []):
+        if len(rep) <= base + pos or not rep[base + pos]:
+            return None
+    rc = spec.get("rcsum")
+    if rc:
+        if len(rep) <= rc["at"] or rep[rc["at"]] != _csum(bytearray(rep), rc):
+            return None
+    lv = spec["level"]
+    pos, scale, vmax = lv[0], (lv[1] if len(lv) > 1 else 1), \
+        (lv[2] if len(lv) > 2 else 100)
+    if len(rep) <= base + pos:
+        return None
+    raw = rep[base + pos]
+    if raw > vmax:
+        return None
+    level = min(100, raw * scale)
+    status = "discharging"
+    ch = spec.get("charge")
+    if ch and len(rep) > base + ch[0] and rep[base + ch[0]] in ch[1]:
+        status = "charging"
+    fu = spec.get("full")
+    if fu and len(rep) > base + fu[0] and rep[base + fu[0]] in fu[1]:
+        status, level = "full", 100
+    mv = None
+    m = spec.get("mv")
+    if m and len(rep) > base + m[0] + 1:
+        a, b = rep[base + m[0]], rep[base + m[0] + 1]
+        mv = (a << 8 | b) if m[1] == "be" else (b << 8 | a)
+    return level, status, mv
+
+
+def build_spec_frames(spec: dict) -> list:
+    out = []
+    for s in spec.get("frames", []):
+        f = bytearray(bytes.fromhex(s.replace(" ", "")))
+        c = spec.get("csum")
+        if c:
+            f += bytes(max(0, c["at"] + 1 - len(f)))
+            f[c["at"]] = _csum(f, c)
+        out.append(bytes(f))
+    return out
+
+
+def _send_frame(dev, d, frame: bytes, ways: list) -> bool:
+    for way in ways:
+        n = d.feature_len if way == "feat" else d.output_len
+        if n < len(frame):
+            continue
+        buf = frame + bytes(n - len(frame))
         try:
-            r = _read_user_protocol(ifaces, p)
+            if way == "feat":
+                ok = dev.set_feature(buf)
+            elif way == "setout":
+                ok = dev.set_output_report(buf)
+            else:
+                dev.write_output(buf)
+                ok = True
+        except Exception:
+            ok = False
+        if ok:
+            return True
+    return False
+
+
+class Adapter:
+    """一个品牌 / 一种协议。claim() 认领接口，read() 读一次电量。"""
+    id = ""
+    brand = ""
+    name = ""
+    kind = "device"
+    verified = True
+    source = ""
+
+    def claim(self, ifaces: list) -> list:
+        return []
+
+    def model_name(self, ifaces: list) -> str:
+        return self.name
+
+    def read(self, ifaces: list) -> Reading:
+        raise NotImplementedError
+
+    def _ok(self, level, status="discharging", detail="", raw=b""):
+        return Reading(ok=True, level=level, status=status,
+                       source=f"{self.brand} 协议", detail=detail, raw=raw)
+
+    def _asleep(self, detail="设备休眠"):
+        return Reading(ok=False, status="asleep", source=f"{self.brand} 协议",
+                       detail=detail)
+
+
+class SpecAdapter(Adapter):
+    def __init__(self, spec: dict):
+        self.spec = spec
+        self.id = spec["id"]
+        self.brand = spec["brand"]
+        self.name = spec["name"]
+        self.kind = spec.get("kind", "device")
+        self.verified = spec.get("verified", False)
+        self.source = spec.get("source", "")
+
+    def claim(self, ifaces):
+        return [d for d in ifaces if _spec_iface_ok(self.spec, d)]
+
+    def model_name(self, ifaces):
+        names = self.spec.get("names", {})
+        for d in ifaces:
+            for key in ((d.vid, d.pid), (d.vid, None)):
+                if key in names:
+                    return names[key]
+        return self.name
+
+    def read(self, ifaces):
+        spec = self.spec
+        frames = build_spec_frames(spec)
+        ways = spec.get("send", [])
+        tries = spec.get("tries", 1 if not ways else 3)
+        timeout = spec.get("timeout", 600) / 1000.0
+        for d in self.claim(ifaces):
+            dev = None
+            try:
+                dev = HidDevice(d.path, write=bool(ways))
+                if spec.get("drain") and spec.get("reply") == "input":
+                    dev.drain()
+                for _ in range(tries):
+                    sent = all(_send_frame(dev, d, f, ways) for f in frames)
+                    if ways and not sent:
+                        return Reading(ok=False, source=f"{self.brand} 协议",
+                                       detail="发送失败（设备被占用？）")
+                    got, rep = self._wait(dev, d, timeout)
+                    if got:
+                        level, status, mv = got
+                        detail = f"{mv} mV" if mv else ""
+                        return self._ok(level, status, detail, rep)
+            except Exception:
+                pass
+            finally:
+                if dev is not None:
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+        return self._asleep()
+
+    def _wait(self, dev, d, timeout):
+        spec = self.spec
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if spec.get("reply") == "feature":
+                time.sleep(0.03)
+                rep = dev.get_feature_report(spec.get("reply_id", 0),
+                                             d.feature_len)
+            else:
+                rep = dev.read_input(max(64, d.input_len), 200)
+            got = parse_spec_reply(spec, rep)
+            if got:
+                return got, rep
+        return None, b""
+
+
+class LogitechAdapter(Adapter):
+    """罗技 LIGHTSPEED / Unifying / Bolt 接收器，HID++ 2.0。
+
+    先 ping 1..4 号设备位找到鼠标（记住），再查 0x1000 BATTERY_STATUS（老款直接给百分比），
+    没有就查 0x1004 UNIFIED_BATTERY 的功能 1 get_status。0x1004 的功能 0 是能力描述，
+    别读（Voltide：读错会让 G HUB 跟着显示错电量）。软件 ID 用 0xE，避开 G HUB 的 0xD。
+    充电状态字节按 Solaar 的定义解析。"""
+    id = "logitech"
+    brand = "罗技"
+    name = "罗技无线设备"
+    kind = "mouse"
+    source = "Voltide（G304、GPW3、M750 真机）· Solaar · FerrisPulse · VigilWatt"
+    MODELS = {0xC53F: "罗技 G304", 0xC539: "罗技 G102 / G304",
+              0xC547: "罗技 G PRO X SUPERLIGHT 2", 0xC54D: "罗技 G PRO X SUPERLIGHT 2",
+              0xC548: "罗技 Bolt 接收器", 0xC52B: "罗技 Unifying 接收器"}
+    SW = 0x0E
+    _index: dict = {}
+
+    RECEIVERS = {0xC52B, 0xC52F, 0xC531, 0xC532, 0xC534, 0xC539, 0xC53A,
+                 0xC53D, 0xC53F, 0xC541, 0xC545, 0xC547, 0xC548, 0xC54D}
+
+    def claim(self, ifaces):
+        # 只认接收器：有线罗技设备也有 HID++ 集合，但设备位 1–4 永远不应答
+        return [d for d in ifaces if d.vid == 0x046D and d.usage_page == 0xFF00
+                and d.usage == 0x0002 and d.output_len == 20
+                and (d.pid in self.RECEIVERS
+                     or "receiver" in (d.product or "").lower())][:1]
+
+    def model_name(self, ifaces):
+        for d in ifaces:
+            if d.pid in self.MODELS:
+                return self.MODELS[d.pid]
+        return self.name
+
+    def _req(self, dev_idx, feat, fn, params=b""):
+        r = bytearray(20)
+        r[0], r[1], r[2] = 0x11, dev_idx, feat
+        r[3] = ((fn & 0x0F) << 4) | self.SW
+        r[4:4 + len(params)] = params
+        return bytes(r)
+
+    def _call(self, dev, dev_idx, feat, fn, params=b"", wait=0.6):
+        req = self._req(dev_idx, feat, fn, params)
+        try:
+            dev.write_output(req)
+        except Exception:
+            return None
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            p = dev.read_input(20, 60)
+            if not p or len(p) < 7 or p[1] != dev_idx:
+                continue
+            if p[2] == 0xFF and p[3] == feat and p[4] == req[3]:
+                return b""          # HID++ 错误回复：设备在，但不支持
+            if p[2] == feat and p[3] == req[3]:
+                return p
+        return None
+
+    def _feature(self, dev, dev_idx, fid):
+        """返回 (特性号, 是否应答)；没唤醒时第一条常被吞掉，试两次。"""
+        for attempt in range(2):
+            p = self._call(dev, dev_idx, 0x00, 0x00,
+                           bytes((fid >> 8, fid & 0xFF)),
+                           0.35 if attempt == 0 else 0.5)
+            if p is not None:
+                return (p[4] if p else 0), True
+            time.sleep(0.25)
+        return 0, False
+
+    def read(self, ifaces):
+        cand = self.claim(ifaces)
+        if not cand:
+            return self._asleep()
+        d = cand[0]
+        dev = None
+        try:
+            dev = HidDevice(d.path, write=True)
+            dev.drain()
+            idx = self._index.get(d.path)
+            if idx is None:
+                budget = time.monotonic() + 3.6
+                for i in range(1, 5):
+                    left = budget - time.monotonic()
+                    if left < 0.15:
+                        break
+                    if self._call(dev, i, 0x00, 0x01, b"\0\0\x5A",
+                                  min(1.1, left)):
+                        idx = self._index[d.path] = i
+                        break
+            if idx is None:
+                return self._asleep()
+            feat, answered = self._feature(dev, idx, 0x1000)
+            fn = 0x00
+            if not feat:
+                if not answered:
+                    return self._asleep()
+                feat, answered = self._feature(dev, idx, 0x1004)
+                fn = 0x01
+                if not feat:
+                    return (self._asleep() if not answered else
+                            Reading(ok=False, source="罗技协议",
+                                    detail="该设备不上报电量"))
+            p = self._call(dev, idx, feat, fn)
+            if not p:
+                return self._asleep()
+            level, state = p[4], p[6]
+            if level > 100:
+                return Reading(ok=False, source="罗技协议", detail="读数异常",
+                               raw=bytes(p))
+            if fn == 0x00:      # 0x1000：1 充电、2 快满、3 已满、4 慢充
+                status = ("full" if state == 3 else "charging"
+                          if state in (1, 2, 4) else "discharging")
+            else:               # 0x1004：1 充电、2 慢充、3 已满
+                status = ("full" if state == 3 else "charging"
+                          if state in (1, 2) else "discharging")
+            return self._ok(level, status, "HID++ 2.0", bytes(p))
+        except Exception:
+            return self._asleep()
+        finally:
+            if dev is not None:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+
+
+class RazerMouseAdapter(Adapter):
+    """雷蛇无线鼠标接收器：91 字节 Feature 控制通道（OpenRazer 的 razer_report）。
+
+    命令类 0x07：0x80 电量（参数[1]，0–255 换算百分比，按 OpenRazer 一律除以 255），
+    0x84 充电（参数[1] 非零）。鼠标集合拒绝读权限，句柄只申请写权限，回复用 GET_FEATURE 取。
+    只认已知的无线接收器 PID，不对未知型号试探。"""
+    id = "razer"
+    brand = "雷蛇"
+    name = "雷蛇无线鼠标"
+    kind = "mouse"
+    source = "Voltide（多款真机）· OpenRazer · FerrisPulse"
+    PIDS = {0x007B: "Viper Ultimate", 0x00C1: "Viper V3 Pro",
+            0x00DF: "Viper V3 Pro SE", 0x00B7: "DeathAdder V3 Pro",
+            0x00C3: "DeathAdder V3 Pro", 0x00BF: "DeathAdder V4 Pro",
+            0x00F0: "DeathAdder V4 Pro 碳纤维", 0x00E6: "Viper V4 Pro",
+            0x00AB: "Basilisk V3 Pro", 0x00CD: "Basilisk V3 Pro 35K",
+            0x00D7: "Basilisk V3 Pro 35K Phantom",
+            0x00C5: "DeathAdder V3 HyperSpeed", 0x00D1: "Pro Click V2",
+            0x00C8: "Pro Click V2 Vertical", 0x00D4: "Basilisk Mobile",
+            0x00B0: "Cobra Pro", 0x00DB: "Cobra HyperSpeed",
+            0x00B4: "Naga V2 HyperSpeed", 0x00B8: "Viper V3 HyperSpeed",
+            0x00B9: "Basilisk V3 X HyperSpeed", 0x00B3: "HyperPolling 接收器",
+            0x009A: "Pro Click Mini", 0x005A: "Lancehead",
+            0x0045: "Mamba Chroma", 0xB007: "DeathAdder V4 HyperSpeed",
+            0xB005: "Viper V4 HyperSpeed"}
+    LEN = 91
+
+    def claim(self, ifaces):
+        return [d for d in ifaces if d.vid == 0x1532 and d.pid in self.PIDS
+                and d.feature_len == self.LEN][:1]
+
+    def model_name(self, ifaces):
+        for d in ifaces:
+            if d.vid == 0x1532 and d.pid in self.PIDS:
+                return "雷蛇 " + self.PIDS[d.pid]
+        return self.name
+
+    @staticmethod
+    def report(cls_, cmd, tx, args=b"\0\0"):
+        b = bytearray(RazerMouseAdapter.LEN)
+        b[2], b[6], b[7], b[8] = tx, len(args), cls_, cmd
+        b[9:9 + len(args)] = args
+        crc = 0
+        for v in b[3:89]:
+            crc ^= v
+        b[89] = crc
+        return bytes(b)
+
+    def _query(self, dev, cmd, tx):
+        if not dev.set_feature(self.report(0x07, cmd, tx)):
+            return None, "发送失败"
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            rep = dev.get_feature_report(0, self.LEN)
+            if rep and rep[2] == tx and rep[1] in (2, 3, 4, 5):
+                return rep, ""
+            time.sleep(0.008)
+        return None, ""
+
+    def read(self, ifaces):
+        cand = self.claim(ifaces)
+        if not cand:
+            return self._asleep()
+        dev = None
+        try:
+            dev = HidDevice(cand[0].path, write=True)
+            for attempt in range(4):
+                rep, err = self._query(dev, 0x80, 0x20 + attempt)
+                if err:
+                    return Reading(ok=False, source="雷蛇协议", detail=err)
+                if rep is None or rep[1] in (3, 4):
+                    time.sleep(0.12)
+                    continue
+                if rep[1] == 5:
+                    return Reading(ok=False, source="雷蛇协议",
+                                   detail="该型号不支持电量查询")
+                if rep[1] != 2 or rep[6] < 2:
+                    continue
+                level = min(100, round(rep[10] * 100 / 255))
+                chg, _ = self._query(dev, 0x84, 0x30 + attempt)
+                charging = bool(chg and chg[1] == 2 and chg[10])
+                return self._ok(level, "charging" if charging else
+                                "discharging", "2.4G", rep[:14])
+            return self._asleep()
+        except Exception:
+            return self._asleep()
+        finally:
+            if dev is not None:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+
+
+def user_specs() -> list:
+    """用户导入的设备规格（声明式适配器，见“导入 / 导出协议”）。"""
+    v = load_config().get("specs")
+    out = []
+    for raw in v if isinstance(v, list) else []:
+        try:
+            out.append(clean_spec(raw))
+        except ValueError:
+            pass
+    return out
+
+
+def adapter_knows(vid: int, pid: int) -> bool:
+    """不看接口、只按 VID:PID 判断有没有适配器可能认领（拔掉的设备用）。"""
+    if ((vid == 0x046D and pid in LogitechAdapter.RECEIVERS)
+            or (vid == 0x1532 and pid in RazerMouseAdapter.PIDS)):
+        return True
+    return any(_spec_ids_match(s, vid, pid)
+               for s in DEVICE_SPECS + user_specs())
+
+
+def all_adapters() -> list:
+    """用户导入的设备规格优先，其次内置。"""
+    user = [SpecAdapter(s) for s in user_specs()]
+    return user + [LogitechAdapter(), RazerMouseAdapter()] + \
+        [SpecAdapter(s) for s in DEVICE_SPECS]
+
+
+def adapters_for(ifaces: list) -> list:
+    out = []
+    for a in all_adapters():
+        try:
+            if a.claim(ifaces):
+                out.append(a)
+        except Exception:
+            pass
+    return out
+
+
+def read_by_adapters(ifaces: list):
+    """返回 (读数, 适配器)；没有适配器认领则 (None, None)。"""
+    found = adapters_for(ifaces)
+    asleep = None
+    for a in found:
+        try:
+            r = a.read(ifaces)
         except Exception:
             r = None
         if r and r.ok:
-            return r, {k: v for k, v in p.items() if k != "vid"}
-    return None, None
+            return r, a
+        if asleep is None and r is not None:
+            asleep = (r, a)
+    return asleep if asleep else (None, None)
 
 
 def protocol_source(proto: Optional[dict]) -> str:
@@ -1795,7 +2415,6 @@ def protocol_source(proto: Optional[dict]) -> str:
     if kind == "preset":
         return "内置协议 · " + str(proto.get("name") or "厂商协议")
     return "抓包协议"
-
 
 # ---------------------------------------------------------------------------
 # 导入 / 导出协议：把抓包得到的协议分享给同款设备的其他用户
@@ -1860,6 +2479,167 @@ def clean_protocol(proto) -> dict:
     return out
 
 
+SPEC_KINDS = ("mouse", "keyboard", "headset", "gamepad", "device")
+
+
+def _hexbytes(s, what: str, lo: int = 1, hi: int = 1024) -> bytes:
+    try:
+        b = bytes.fromhex(str(s).replace(" ", ""))
+    except ValueError:
+        raise ValueError(f"{what}不是十六进制：{s}") from None
+    if not lo <= len(b) <= hi:
+        raise ValueError(f"{what}长度不对：{s}")
+    return b
+
+
+def _int(v, what: str, lo: int, hi: int) -> int:
+    if isinstance(v, str):
+        try:
+            v = int(v, 0)
+        except ValueError:
+            raise ValueError(f"{what}不是数字：{v}") from None
+    if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+        raise ValueError(f"{what}的值不对：{v!r}")
+    return v
+
+
+def _csum_spec(c, what: str) -> dict:
+    if not isinstance(c, dict) or c.get("kind") not in ("sum", "const"):
+        raise ValueError(f"{what}只支持 sum / const 两种")
+    out = {"kind": c["kind"], "from": _int(c.get("from"), what, 0, 1023),
+           "to": _int(c.get("to"), what, 0, 1023),
+           "at": _int(c.get("at"), what, 0, 1023)}
+    if c["kind"] == "const":
+        out["const"] = _int(c.get("const"), what, 0, 255)
+    return out
+
+
+def clean_spec(raw) -> dict:
+    """校验一条导入的设备规格（声明式适配器）。
+
+    参考 FerrisPulse 的 FDAS：必须带一条真机回复样本 sample，导入时用它回放解析，
+    解析不出电量的规格一律拒收；会向设备写入的规格必须写明 PID，不能“同 VID 就试”。"""
+    if not isinstance(raw, dict):
+        raise ValueError("设备规格应该是一个 JSON 对象")
+    name = str(raw.get("name") or "").strip()[:40]
+    if not name:
+        raise ValueError("设备规格缺少名称（name）")
+    spec = {"id": "user:" + str(raw.get("id") or name)[:40], "name": name,
+            "brand": str(raw.get("brand") or name.split()[0])[:20],
+            "kind": raw.get("kind", "device"), "verified": False,
+            "source": "导入的设备规格"}
+    if spec["kind"] not in SPEC_KINDS:
+        raise ValueError(f"设备类型（kind）不对：{spec['kind']}")
+    ids = raw.get("ids")
+    if not isinstance(ids, list) or not ids or len(ids) > 32:
+        raise ValueError("缺少设备编号（ids），例如 [[\"373B\", \"1278\"]]")
+    spec["ids"] = []
+    for it in ids:
+        if not isinstance(it, list) or len(it) != 2:
+            raise ValueError(f"设备编号格式不对：{it}")
+        vid = _int(int(it[0], 16) if isinstance(it[0], str) else it[0],
+                   "VID", 0, 0xFFFF)
+        pid = None if it[1] is None else _int(
+            int(it[1], 16) if isinstance(it[1], str) else it[1], "PID", 0, 0xFFFF)
+        spec["ids"].append((vid, pid))
+    for k in ("page", "page_min", "usage"):
+        if k in raw:
+            spec[k] = _int(raw[k], k, 0, 0xFFFF)
+    lens = raw.get("lens", {})
+    if not isinstance(lens, dict) or any(k not in ("in", "out", "feat")
+                                         for k in lens):
+        raise ValueError("报告长度（lens）只认 in / out / feat")
+    spec["lens"] = {k: _int(v, f"lens.{k}", 1, 1024) for k, v in lens.items()}
+    spec["lens_min"] = bool(raw.get("lens_min", False))
+    send = raw.get("send", [])
+    if not isinstance(send, list) or any(w not in ("out", "setout", "feat")
+                                         for w in send):
+        raise ValueError("发送方式（send）只认 out / setout / feat")
+    spec["send"] = send
+    if send and any(p is None for _v, p in spec["ids"]):
+        raise ValueError("会向设备写入的规格必须写明 PID")
+    frames = raw.get("frames", [])
+    if not isinstance(frames, list) or len(frames) > 8 or (send and not frames):
+        raise ValueError("查询帧（frames）不对")
+    spec["frames"] = [" ".join(f"{b:02X}" for b in _hexbytes(f, "查询帧"))
+                      for f in frames]
+    if raw.get("reply", "input") not in ("input", "feature"):
+        raise ValueError("回复类型（reply）只认 input / feature")
+    spec["reply"] = raw.get("reply", "input")
+    spec["reply_id"] = _int(raw.get("reply_id", 0), "reply_id", 0, 255)
+    for k in ("csum", "rcsum"):
+        if k in raw:
+            spec[k] = _csum_spec(raw[k], k)
+    expect = raw.get("expect", [])
+    if not isinstance(expect, list):
+        raise ValueError("回复特征（expect）不对")
+    spec["expect"] = [[_int(a, "expect", 0, 1023), _int(b, "expect", 0, 255)]
+                      for a, b in (e if isinstance(e, list) and len(e) == 2
+                                   else (None, None) for e in expect)]
+    spec["nz"] = [_int(v, "nz", 0, 1023) for v in raw.get("nz", [])]
+    if "find" in raw:
+        spec["find"] = list(_hexbytes(raw["find"], "特征串（find）", 2, 16))
+    if not spec["expect"] and "find" not in spec:
+        raise ValueError("必须给出回复特征（expect 或 find），否则无法确认回复属于这次查询")
+    lv = raw.get("level")
+    if not isinstance(lv, list) or not 1 <= len(lv) <= 3:
+        raise ValueError("电量位置（level）应为 [位置] 或 [位置, 倍率, 原始上限]")
+    spec["level"] = [_int(lv[0], "level", 0, 1023)] + \
+        [_int(v, "level", 1, 255) for v in lv[1:]]
+    for k in ("charge", "full"):
+        if k in raw:
+            v = raw[k]
+            if not isinstance(v, list) or len(v) != 2 or not isinstance(v[1],
+                                                                       list):
+                raise ValueError(f"{k} 应为 [位置, [值…]]")
+            spec[k] = [_int(v[0], k, 0, 1023),
+                       [_int(x, k, 0, 255) for x in v[1]]]
+    spec["timeout"] = _int(raw.get("timeout", 600), "timeout", 100, 5000)
+    if "tries" in raw:
+        spec["tries"] = _int(raw["tries"], "tries", 1, 5)
+    spec["drain"] = bool(raw.get("drain", False))
+    sample = _hexbytes(raw.get("sample", ""), "回复样本（sample）")
+    if parse_spec_reply(spec, sample) is None:
+        raise ValueError("回复样本（sample）按这份规格解析不出电量，请检查偏移和特征")
+    spec["sample"] = " ".join(f"{b:02X}" for b in sample)
+    return spec
+
+
+def _spec_json(spec: dict) -> dict:
+    """规格存进配置 / 导出文件时的形式（PID 为 None 原样保留）。"""
+    out = {k: v for k, v in spec.items()
+           if k not in ("verified", "source", "names")}
+    out["id"] = str(spec["id"]).removeprefix("user:")
+    out["ids"] = [[f"{v:04X}", None if p is None else f"{p:04X}"]
+                  for v, p in spec["ids"]]
+    return out
+
+
+def parse_import(text: str, default_key: str = "") -> tuple:
+    """解析导入文件，返回 ({"VID:PID": 协议}, [设备规格])。"""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise ValueError("文件内容不是有效的 JSON，可能不是协议文件") from None
+    if not isinstance(data, dict):
+        raise ValueError("文件格式不对，可能不是协议文件")
+    specs = []
+    raw_specs = data.get("specs")
+    if raw_specs is not None:
+        if not isinstance(raw_specs, list):
+            raise ValueError("设备规格（specs）应该是一个列表")
+        for i, raw in enumerate(raw_specs, 1):
+            try:
+                specs.append(clean_spec(raw))
+            except ValueError as e:
+                raise ValueError(f"第 {i} 个设备规格：{e}") from None
+    protos = {}
+    if specs and "protocols" not in data:
+        return protos, specs
+    protos = parse_protocol_import(text, default_key)
+    return protos, specs
+
+
 def parse_protocol_import(text: str, default_key: str = "") -> dict:
     """解析导入文件，返回 {"VID:PID": 协议}。
 
@@ -1898,8 +2678,16 @@ def parse_protocol_import(text: str, default_key: str = "") -> dict:
 
 def import_protocols(text: str, default_key: str = "",
                      add_devices: bool = False) -> dict:
-    """导入并保存协议；返回 {"VID:PID": 协议}。add_devices 时顺便添加设备（CLI 用）。"""
-    protos = parse_protocol_import(text, default_key)
+    """导入并保存协议和设备规格；返回 {"VID:PID" 或 "spec:名称": 内容}。
+    add_devices 时顺便添加协议对应的设备（CLI 用；规格对应的设备插着时会自动出现）。"""
+    protos, specs = parse_import(text, default_key)
+    if specs:
+        cfg = load_config()
+        saved = [s for s in (cfg.get("specs") or []) if isinstance(s, dict)]
+        new_ids = {s["id"].removeprefix("user:") for s in specs}
+        saved = [s for s in saved if str(s.get("id")) not in new_ids]
+        cfg["specs"] = saved + [_spec_json(s) for s in specs]
+        save_config(cfg)
     for key, p in protos.items():
         vid, pid = (int(x, 16) for x in key.split(":"))
         if p["kind"] == "standard":
@@ -1922,7 +2710,40 @@ def import_protocols(text: str, default_key: str = "",
                 vid, pid = (int(x, 16) for x in key.split(":"))
                 devs.append({"vid": vid, "pid": pid, "name": ""})
         save_saved_devices(devs)
-    return protos
+    out = dict(protos)
+    for sp in specs:
+        out["spec:" + sp["name"]] = sp
+    return out
+
+
+def device_info_text(r: "Reading", ifaces=None) -> str:
+    """设备诊断信息：接口指纹、认领它的适配器、已保存协议、最近一次读数。"""
+    vid, pid = r.vid, r.pid
+    try:
+        ifaces = ifaces if ifaces is not None else enumerate_hid()
+    except Exception:
+        ifaces = []
+    cand = [d for d in ifaces if d.vid == vid and d.pid == pid]
+    lines = [f"设备：{r.name}", f"VID:PID：{vid:04X}:{pid:04X}"]
+    prod = next((d.product for d in cand if d.product), "")
+    manu = next((d.manufacturer for d in cand if d.manufacturer), "")
+    if prod or manu:
+        lines.append(f"产品 / 厂商字符串：{prod or '-'} / {manu or '-'}")
+    lines.append(f"HID 接口（{len(cand)} 个）：")
+    lines += ["  " + d.label for d in cand] or ["  （现在没插着）"]
+    found = adapters_for(cand) if cand else []
+    lines.append("认领的适配器：" + ("、".join(
+        f"{a.name}（{'已验证' if a.verified else '未验证'}）" for a in found)
+        or "无"))
+    proto = user_protocols().get(f"{vid:04X}:{pid:04X}")
+    lines.append("已保存的协议：" + (proto.get("kind", "captured")
+                                  if isinstance(proto, dict) else "无"))
+    state = f"{r.level}%" if r.ok and r.level is not None else r.status
+    lines.append(f"最近读数：{state}（{r.source or '-'}；{r.detail or '-'}）")
+    if r.raw:
+        lines.append("最近回复：" + bytes(r.raw[:64]).hex(" ").upper())
+    lines.append(f"程序：2.4G 外设电量 · Python {sys.version.split()[0]}")
+    return "\n".join(lines)
 
 
 def export_protocols_text(keys=None) -> str:
@@ -2655,6 +3476,7 @@ def read_saved_all(devices: Optional[list] = None) -> dict[str, Reading]:
            for d in devices}
     res = apply_last_known(res)
     res.update(read_bluetooth_all())
+    res.update(read_xinput_all())
     return res
 
 
@@ -3957,7 +4779,7 @@ class HelpWindow(_Fluent):
                                        c["stroke_top"], c["stroke_bot"]))
         self._ctext(32, top + 22, "为什么读不到", c["text"],
                     self._f(11, True), anchor="w")
-        self._ctext(32, top + 44, "接收器在，但内置协议里没有这款设备；可以抓包学习。",
+        self._ctext(32, top + 44, "还没适配：右键卡片「复制设备信息」提 Issue，或导入协议文件。",
                     c["sub"], self._f(10), anchor="w")
         self._link(W - 32, top + 22, "有协议文件？直接导入", self._import,
                    "lnk_import", size=9, anchor="e")
@@ -5163,6 +5985,8 @@ class Panel(_Fluent):
             st = "电量低" if r.level is not None and r.level < 20 else (
                 r.detail or "")
             return ("蓝牙 · " + st if st else "蓝牙"), False
+        if r.kind == "gamepad":
+            return "手柄 · " + (r.detail or "XInput"), False
         if r.status == "unknown_proto":
             return "协议未知", True
         if r.stale:
@@ -5204,8 +6028,9 @@ class Panel(_Fluent):
         cv.create_image(x1 + 14, cy - 19, anchor="nw", tags=tags,
                         image=self._disc(38, well))
         gcol = _mix(col, c["text"], 0.35) if lv is not None else c["text"]
-        glyph = _device_glyph(r.name, "bluetooth" if r.kind == "bluetooth"
-                              else "device")
+        glyph = _device_glyph(r.name, {"bluetooth": "bluetooth",
+                                        "gamepad": "gamepad"}.get(r.kind,
+                                                                  "device"))
         texts.append((self._ctext(x1 + 33, cy, glyph, gcol,
                                   self._fi(15), tags=tags), gcol))
         if r.ok and r.status == "charging" and not r.stale:
@@ -5456,16 +6281,18 @@ class Panel(_Fluent):
         if r is not None and r.status == "unknown_proto":
             items.append((GLYPH["settings"], "设置读取…",
                           lambda k=key: self.open_help(k)))
-        if r is not None and r.kind != "bluetooth":
+        if r is not None and r.kind == "hid":
             items.append((GLYPH["import"], "导入协议…",
                           lambda k=key: self.import_protocol(k)))
+            items.append((GLYPH["info"], "复制设备信息",
+                          lambda k=key: self.copy_device_info(k)))
             proto = user_protocols().get(f"{r.vid:04X}:{r.pid:04X}")
             if isinstance(proto, dict) and proto.get("kind") != "standard":
                 items.append((GLYPH["export"], "导出协议…",
                               lambda k=key: self.export_protocol(k)))
         items.append((GLYPH["refresh"], "立即刷新", self._refresh))
         items.append(None)
-        if r is not None and r.kind == "bluetooth":
+        if r is not None and r.kind in ("bluetooth", "gamepad"):
             items.append((GLYPH["hide"], "不再显示",
                           lambda k=key: self.delete_device(k)))
         else:
@@ -5497,8 +6324,11 @@ class Panel(_Fluent):
                                      parent=owner)
                 return False
             for k, p in protos.items():
+                if k.startswith("spec:"):
+                    continue
                 vid, pid = (int(x, 16) for x in k.split(":"))
                 self.app.add_device(vid, pid, "")
+            self.app.auto_add_known()
             names = "、".join(
                 f"{p.get('name') or k}" for k, p in list(protos.items())[:3])
             more = f" 等 {len(protos)} 台设备" if len(protos) > 3 else ""
@@ -5507,6 +6337,24 @@ class Panel(_Fluent):
                 "没插的话，插上接收器就能看到。", parent=owner)
             self.app.refresh()
             return True
+        finally:
+            self._modal = False
+
+    def copy_device_info(self, key):
+        """把这台设备的接口指纹和最近一次回复复制到剪贴板，提 Issue 适配新设备用。"""
+        self._close_menu()
+        r = self.app.snapshot().get(key)
+        if r is None or not r.vid:
+            return
+        text = device_info_text(r)
+        self._modal = True
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            messagebox.showinfo(
+                "复制设备信息", "已复制到剪贴板。\n\n想让软件支持这台设备，可以到项目主页"
+                "提一个 Issue，把这段信息粘贴进去，并写上设备型号。",
+                parent=self.root)
         finally:
             self._modal = False
 
@@ -5966,6 +6814,17 @@ class Tray:
         if not menu:
             return
         try:
+            # 每台设备一行（参考 Voltide），点了打开面板
+            rows = sorted(self.app.snapshot().values(),
+                          key=lambda r: (r.level is None, r.level or 0))
+            for r in rows[:8]:
+                lv = f"{r.level}%" if r.ok and r.level is not None else "--"
+                mark = " ⚡" if r.ok and r.status == "charging" else ""
+                name = (r.name or "设备")[:24].replace("&", "&&")
+                user32.AppendMenuW(menu, MF_STRING, TRAY_OPEN,
+                                   f"{name}\t{lv}{mark}")
+            if rows:
+                user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
             user32.AppendMenuW(menu, MF_STRING, TRAY_OPEN, "打开电量面板")
             user32.AppendMenuW(menu, MF_STRING, TRAY_REFRESH, "立即刷新")
             user32.AppendMenuW(menu, MF_STRING, TRAY_IMPORT, "导入协议…")
@@ -6184,16 +7043,19 @@ class TrayApp:
             return
         self._last_poll = now
         try:
-            present = {(d.vid, d.pid) for d in enumerate_hid()}
+            ifaces = enumerate_hid()
         except Exception:
             return
+        present = {(d.vid, d.pid) for d in ifaces}
         if self._seen is None:
             self._seen = present
             self._asked = set(present)
+            self._auto_add(ifaces, present)
             return
         new = present - self._seen
         self._seen = present
         self._asked &= present
+        self._auto_add(ifaces, new)
         for vid, pid in sorted(new):
             if (vid, pid) in self._asked:
                 continue
@@ -6203,6 +7065,35 @@ class TrayApp:
             self._asked.add((vid, pid))
             self._pending_add = (vid, pid)
             break
+
+    def _auto_add(self, ifaces: list, keys) -> int:
+        """内置适配器认得的设备直接加入面板，不弹确认框（参考 Voltide：接入即出现）。
+        用户删过的设备记在 dismissed 里，不再自动加回来；重新插拔时仍会弹框询问。"""
+        dismissed = set(load_config().get("dismissed") or [])
+        have = {(d["vid"], d["pid"]) for d in self.devices}
+        added = 0
+        for vid, pid in sorted(keys):
+            if (vid, pid) in have or f"{vid:04X}:{pid:04X}" in dismissed:
+                continue
+            cand = [d for d in ifaces if d.vid == vid and d.pid == pid]
+            found = adapters_for(cand)
+            if not found:
+                continue
+            self.devices.append({"vid": vid, "pid": pid,
+                                 "name": found[0].model_name(cand)})
+            self._asked.add((vid, pid))
+            added += 1
+        if added:
+            save_saved_devices(self.devices)
+            self.refresh()
+        return added
+
+    def auto_add_known(self) -> int:
+        try:
+            ifaces = enumerate_hid()
+        except Exception:
+            return 0
+        return self._auto_add(ifaces, {(d.vid, d.pid) for d in ifaces})
 
     def _show_add(self, vid: int, pid: int):
         try:
@@ -6227,11 +7118,16 @@ class TrayApp:
             return
         self.devices.append({"vid": vid, "pid": pid, "name": name})
         save_saved_devices(self.devices)
+        cfg = load_config()
+        dismissed = cfg.get("dismissed")
+        if isinstance(dismissed, list) and f"{vid:04X}:{pid:04X}" in dismissed:
+            dismissed.remove(f"{vid:04X}:{pid:04X}")
+            save_config(cfg)
         self.refresh()
 
     def remove_device(self, key: str):
-        if key.startswith("bt_"):
-            # 蓝牙设备不是手动添加的，“删除”就是不再显示
+        if key.startswith(("bt_", "xi_")):
+            # 蓝牙设备和手柄不是手动添加的，“删除”就是不再显示
             cfg = load_config()
             hidden = list(cfg.get("bt_hidden") or [])
             if key not in hidden:
@@ -6256,6 +7152,12 @@ class TrayApp:
             last = cfg.get("last")
             if isinstance(last, dict):
                 last.pop(key, None)
+            dismissed = [k for k in (cfg.get("dismissed") or [])
+                         if isinstance(k, str)]
+            dk = f"{removed['vid']:04X}:{removed['pid']:04X}"
+            if dk not in dismissed:
+                dismissed.append(dk)
+            cfg["dismissed"] = dismissed
             save_config(cfg)
         with self._lock:
             self._readings.pop(key, None)
