@@ -58,6 +58,7 @@ python my_devices.py
 | 雷柏 Rapoo | 带 19 字节状态流的接收器（如 VT3 二代） | **只听不写** | FerrisPulse · VigilWatt 真机 |
 | ROG | OMNI 接收器下的键盘（如夜魔 AZOTH EXTREME） | 查询帧 | Voltide 真机 |
 | 宏碁 Acer | OMR 系列无线鼠标 | 查询帧 | FerrisPulse（贡献者真机） |
+| 怒喵 Angry Miao | INFINITY MOUSE（`3151:5007` 接收器） | Feature 查询 | AngryMiaoBatteryMgr 真机 · HaloBattery |
 | DARKRIM | SHADOW 耳机（杰理方案） | 查询帧 | 2.4G-battery-viewer 真机 |
 | VAXEE / ZYGEN | 无线鼠标 | Feature 查询，5% 一档 | 两处文档一致，**未经真机验证** |
 | LAMZU / Pulsar / WLmouse | 用 PixArt 方案的无线鼠标 | Feature 查询 | FerrisPulse 文档，**未经真机验证** |

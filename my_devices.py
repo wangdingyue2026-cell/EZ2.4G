@@ -1821,6 +1821,7 @@ def _jl_query(tlv: int) -> str:
 #   frames  要发的帧（含报告 ID），最后一帧之后等回复；csum 给出帧内校验和算法
 #   reply   input / feature（reply_id 为 GET_FEATURE 的报告 ID）
 #   expect  回复里必须相等的 [位置, 值]；nz 必须非零的位置；find 在回复里找特征串
+#   oneof   [位置, [允许的值…]]
 #   rcsum   回复的校验和；level=[位置, 倍率, 原始上限]；charge/full=[位置, [值…]]
 #   mv      [位置, "be"/"le"] 电池毫伏（只显示）
 DEVICE_SPECS = [
@@ -1909,6 +1910,14 @@ DEVICE_SPECS = [
      "expect": [[0, 0x00], [1, 0x10], [3, 0x01]], "level": [14],
      "timeout": 600, "drain": True,
      "verified": True, "source": "FerrisPulse 文档（OMR331 贡献者真机）"},
+    {"id": "am_mouse", "brand": "怒喵", "name": "怒喵 INFINITY MOUSE",
+     "kind": "mouse", "ids": [(0x3151, 0x5007)], "page": 0xFFFF,
+     "usage": 0x0002, "lens": {"feat": 65}, "send": ["feat"],
+     "frames": ["00 F7"], "reply": "feature", "reply_id": 0x05,
+     "expect": [[0, 0x05], [2, 0x00]], "oneof": [[1, [0, 1]]],
+     "level": [3], "timeout": 400,
+     "verified": True,
+     "source": "AngryMiaoBatteryMgr（INFINITY MOUSE .100 真机）· HaloBattery · miaobat"},
     {"id": "vaxee", "brand": "VAXEE", "name": "VAXEE 无线鼠标", "kind": "mouse",
      "ids": [(0x3057, None)], "page": 0xFF05, "lens": {"feat": 64},
      "send": ["feat"], "frames": ["0E A5 0B 01 01"], "reply": "feature",
@@ -1971,6 +1980,9 @@ def parse_spec_reply(spec: dict, rep: Optional[bytes]):
             return None
     for pos in spec.get("nz", []):
         if len(rep) <= base + pos or not rep[base + pos]:
+            return None
+    for pos, vals in spec.get("oneof", []):
+        if len(rep) <= base + pos or rep[base + pos] not in vals:
             return None
     rc = spec.get("rcsum")
     if rc:
@@ -2577,6 +2589,11 @@ def clean_spec(raw) -> dict:
                       for a, b in (e if isinstance(e, list) and len(e) == 2
                                    else (None, None) for e in expect)]
     spec["nz"] = [_int(v, "nz", 0, 1023) for v in raw.get("nz", [])]
+    spec["oneof"] = [[_int(a, "oneof", 0, 1023), [_int(x, "oneof", 0, 255)
+                                                 for x in b]]
+                     for a, b in (o if isinstance(o, list) and len(o) == 2
+                                  and isinstance(o[1], list) else (None, [])
+                                  for o in raw.get("oneof", []))]
     if "find" in raw:
         spec["find"] = list(_hexbytes(raw["find"], "特征串（find）", 2, 16))
     if not spec["expect"] and "find" not in spec:
@@ -3801,6 +3818,7 @@ GLYPH = {
     "settings": "", "info": "", "bolt": "",
     "bluetooth": "", "hide": "",
     "import": "", "export": "",
+    "edit": "", "done": "",
 }
 
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
@@ -4577,6 +4595,9 @@ class _Fluent:
         elif kind == "accent":
             fills = [c["accent"], c["accent_hover"]]
             stroke, col, hcol = None, c["on_accent"], c["on_accent"]
+        elif kind == "danger":
+            fills = [c["ctl"], _mix(c["ctl_hover"], c["bad"], 0.16)]
+            stroke, col, hcol = c["ctl_stroke"], c["bad"], c["bad"]
         elif kind == "subtle":
             fills = [None, c["subtle_hover"]]
             stroke, col, hcol = None, c["sub"], c["text"]
@@ -5501,6 +5522,7 @@ class Panel(_Fluent):
         self._help_win = None
         self._menu = None
         self._modal = False
+        self._editing = False
         self._scroll = 0.0
         self._render_scroll = 0.0
         self._max_scroll = 0.0
@@ -5607,6 +5629,7 @@ class Panel(_Fluent):
         self._startup_var = startup_enabled()
         self._set_theme(self.app.theme_light)
         self._scroll = 0.0
+        self._editing = False
         self._shown_lv = {}
         self._hover_key = None
         self.render(entrance=True)
@@ -5860,14 +5883,23 @@ class Panel(_Fluent):
             bx -= 36
         self._button(bx, 13, 32, 32, GLYPH["refresh"], self._refresh,
                      kind="subtle", tag="btn_refresh", glyph=True, size=13)
+        if n or self._editing:
+            bx -= 36
+            self._button(bx, 13, 32, 32,
+                         GLYPH["done"] if self._editing else GLYPH["edit"],
+                         self._toggle_edit, kind="subtle", tag="btn_edit",
+                         glyph=True, size=13)
 
         # 底栏
         cv.create_rectangle(0, foot_y, W, LH, fill=_rgb(c["footer"]),
                             outline="")
         cv.create_line(0, foot_y, W, foot_y, fill=_rgb(c["divider"]),
                        width=self._px(1))
-        self._ctext(18, foot_y + self.FOOT_H / 2, self._updated_text(),
-                    c["sub"], self._f(10), anchor="w")
+        self._ctext(18, foot_y + self.FOOT_H / 2,
+                    "编辑中：点「删除」移除设备" if self._editing
+                    else self._updated_text(),
+                    c["link"] if self._editing else c["sub"], self._f(10),
+                    anchor="w")
         tx = W - 18 - 40
         self._toggle(tx, foot_y + (self.FOOT_H - 20) / 2, self._startup_var)
         self._ctext(tx - 10, foot_y + self.FOOT_H / 2, "开机自启", c["text"],
@@ -6041,7 +6073,7 @@ class Panel(_Fluent):
                         self._fi(8), tags=tags)
 
         tx = x1 + 64
-        rx = x2 - 14 - self.RING
+        rx = x2 - 14 - (64 if self._editing else self.RING)
         name_font = self._f(11, True)
         nm = self._ctext(tx, cy - 10, self._fit(r.name or "设备", name_font,
                                                rx - 12 - tx),
@@ -6069,6 +6101,22 @@ class Panel(_Fluent):
             cv.addtag_withtag("lst", link)
             cv.addtag_withtag(tag, link)
             texts.append((link, c["link"]))
+
+        if self._editing:
+            # 编辑模式：圆环换成删除 / 隐藏按钮
+            hide = r.kind in ("bluetooth", "gamepad")
+            btn = self._button(x2 - 14 - 64, cy - 15, 64, 30,
+                               "隐藏" if hide else "删除",
+                               lambda k=key: self.confirm_delete(k),
+                               kind="danger", tag=f"btn_del_{key}", size=10)
+            cv.addtag_withtag("lst", btn)
+            cv.addtag_withtag(tag, btn)
+            self._card_texts[key] = texts
+            cv.tag_bind(tag, "<Enter>",
+                        lambda e, k=key: self._hover_card(k, True))
+            cv.tag_bind(tag, "<Leave>",
+                        lambda e, k=key: self._hover_card(k, False))
+            return
 
         # 电量圆环：从上次显示值（新打开时从 0）扫到当前值，数字同步计数
         ring_y = cy - self.RING / 2
@@ -6297,7 +6345,7 @@ class Panel(_Fluent):
                           lambda k=key: self.delete_device(k)))
         else:
             items.append((GLYPH["delete"], "删除设备",
-                          lambda k=key: self.delete_device(k)))
+                          lambda k=key: self.confirm_delete(k)))
         self._menu = FluentMenu(self, items, e.x_root, e.y_root)
 
     # -- 导入 / 导出协议 ------------------------------------------------------
@@ -6387,6 +6435,36 @@ class Panel(_Fluent):
                 parent=self.root)
         finally:
             self._modal = False
+
+    def _toggle_edit(self):
+        self._editing = not self._editing and bool(self.app.snapshot())
+        self.render()
+
+    def confirm_delete(self, key: str):
+        """删除前确认，并告诉用户之后怎么加回来。"""
+        self._close_menu()
+        r = self.app.snapshot().get(key)
+        if r is None:
+            return
+        name = r.name or "这台设备"
+        if r.kind in ("bluetooth", "gamepad"):
+            title, msg = "隐藏设备", (
+                f"不再显示「{name}」？\n\n想恢复的话，在托盘右键菜单里把"
+                "「显示蓝牙设备电量」关掉再打开。")
+        else:
+            title, msg = "删除设备", (
+                f"从面板里删除「{name}」？\n\n之后插上也不会再自动添加；想加回来，"
+                "重新拔插接收器，在弹窗里点「添加」。")
+        self._modal = True
+        try:
+            ok = messagebox.askyesno(title, msg, parent=self.root)
+        finally:
+            self._modal = False
+        if ok:
+            self.delete_device(key)
+            if not self.app.snapshot():
+                self._editing = False
+                self.render()
 
     def delete_device(self, key: str):
         self._close_menu()

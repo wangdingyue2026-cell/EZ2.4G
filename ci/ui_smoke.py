@@ -130,6 +130,13 @@ for light in (False, True):
             else:
                 grab(p._menu.root, f"menu_{tag}")
                 p._close_menu()
+            p._toggle_edit()
+            pump(p.root, 0.3)
+            if not p._btns.get("btn_del_a"):
+                errors.append("edit mode shows no delete button on card a")
+            grab(p.root, f"edit_{tag}")
+            p._toggle_edit()
+            pump(p.root, 0.2)
             p._edit_name_at("a")
             pump(p.root, 0.2)
             grab(p.root, f"rename_{tag}")

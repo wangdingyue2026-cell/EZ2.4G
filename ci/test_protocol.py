@@ -445,6 +445,20 @@ def pixart_finds_reply_after_wait_frames():
 
 
 @case
+def angry_miao_mouse_real_sample():
+    """怒喵 INFINITY MOUSE .100 真机样本：Windows 偏移 3 = 72%；状态字节只认 00 / 01。"""
+    rep = H("050000480100010200000164000100F4000100F300140000000A05"
+            + "00" * 38)
+    assert md.parse_spec_reply(spec("am_mouse"), rep)[0] == 72
+    bad = bytearray(rep)
+    bad[1] = 0x02
+    assert md.parse_spec_reply(spec("am_mouse"), bytes(bad)) is None
+    ifs = [hid("am", 0x3151, 0x5007, 0xFFFF, feat=65, usage=2)]
+    assert claimed(ifs) == ["am_mouse"]
+    assert claimed([hid("lb", 0x3151, 0x402D, 0xFFFF, feat=65, usage=2)]) == []
+
+
+@case
 def logitech_hidpp_unified_battery():
     """GPW3 真机抓包：0x1000 不存在 → 0x1004 功能 1，回复 11 01 06 1E 61 08 00 = 97%。"""
     ping = pad(H("11 01 00 1E 04 02 5A"), 20)
