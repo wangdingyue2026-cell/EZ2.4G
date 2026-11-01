@@ -8,6 +8,8 @@ import importlib.util
 import os
 import struct
 import sys
+
+sys.stdout.reconfigure(encoding="utf-8")  # Windows 控制台默认 cp1252
 import tempfile
 import types
 

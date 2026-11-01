@@ -6,6 +6,8 @@ import ctypes
 import importlib.util
 import sys
 
+sys.stdout.reconfigure(encoding="utf-8")  # Windows 控制台默认 cp1252
+
 if sys.platform != "win32":
     class _Fn:
         def __call__(self, *a, **k):
