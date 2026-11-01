@@ -48,6 +48,13 @@ SNAP = {
 }
 
 
+MANY = dict(SNAP)
+MANY["e"] = reading(ok=True, level=88, name="罗技 G304", status="discharging",
+                    vid=0x046D, pid=0xC53F, device_type="mouse")
+MANY["f"] = reading(ok=True, level=62, name="迈从 K99 V2 键盘",
+                    status="discharging", vid=0x3554, pid=0xFA09)
+
+
 TEMPS = {
     False: {"cpu": {"value": 58.0, "approx": False},
             "gpus": [{"name": "NVIDIA", "value": 76.0},
@@ -104,7 +111,9 @@ def report(exc, val, tb):
 
 for light in (False, True):
     tag = "light" if light else "dark"
-    for label, snap in (("devices", SNAP), ("empty", {})):
+    for label, snap in (("devices", SNAP), ("empty", {}), ("many", MANY)):
+        if label == "many" and light:
+            continue
         app = make_app(light, dict(snap))
         p = md.Panel(app)
         app.panel = p
@@ -117,6 +126,9 @@ for light in (False, True):
             record(p.root, box, "anim_open_dark", 1.4)
         pump(p.root, 1.5)
         grab(p.root, f"panel_{label}_{tag}")
+        if label == "many" and p._max_scroll > 0 and p._fit_rows() >= len(snap):
+            errors.append(f"panel scrolls with {len(snap)} devices although "
+                          f"{p._fit_rows()} rows fit on screen")
         if label == "devices":
             cy = p._list[0] + p.CARD_H / 2  # 第一张卡片中间
             ev = types.SimpleNamespace(

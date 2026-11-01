@@ -6499,7 +6499,6 @@ class Panel(_Fluent):
     FOOT_H = 52
     CARD_H = 68
     GAP = 6
-    MAX_ROWS = 5
     EMPTY_H = 210
     RING = 44
 
@@ -6612,6 +6611,18 @@ class Panel(_Fluent):
                 except Exception:
                     pass
         threading.Thread(target=work, daemon=True).start()
+
+    def _fit_rows(self) -> int:
+        """面板有几台设备就显示几行，不用滚动；只有屏幕放不下时才限制行数。"""
+        try:
+            _l, t, _r, b, _sw, _sh = work_area()
+        except Exception:
+            t = b = 0
+        if b - t <= 0:
+            return 50
+        avail = (b - t) / self.S - 2 * 12 - (self.HEAD_H + self.TEMP_H + 12
+                                              + self.FOOT_H)
+        return max(1, int((avail + self.GAP) // (self.CARD_H + self.GAP)))
 
     def _spec_refresh(self, frame):
         D, col = self._px(16), self.c["sub"]
@@ -6840,7 +6851,7 @@ class Panel(_Fluent):
         keys = list(snap.keys())
         n = len(keys)
         if n:
-            vis = min(n, self.MAX_ROWS)
+            vis = min(n, self._fit_rows())
             list_h = vis * self.CARD_H + (vis - 1) * self.GAP
             content = n * self.CARD_H + (n - 1) * self.GAP
         else:
