@@ -546,6 +546,27 @@ def legacy_preset_is_fallback_only():
     assert r.ok and r.level == 60 and r.source == "ATK 协议", r
 
 
+@case
+def addable_devices_for_picker():
+    """「添加设备」只列插着、没加过的接收器：能读电量的在前，普通键鼠和蓝牙不列。"""
+    store = {"protocols": {"5555:0001": {"kind": "captured", "v": 2,
+                                          "requests": ["06 01"], "offset": 3}}}
+    memory_config(store)
+    bt = md.dataclasses.replace(hid("b", 0x046D, 0xB023, 0xFF00, 20, 20),
+                                instance="BTHENUM\\X")
+    ifs = [hid("z", 0x9999, 0x0001, 0xFF00, 64, 64, product="Zeta Receiver"),
+           hid("a", 0x373B, 0x1278, 0xFF02, 17, 17),
+           hid("k", 0x1111, 0x2222, 0x0001, 8),            # 普通有线键盘
+           hid("s", 0x5555, 0x0001, 0x0001, 8),            # 保存过协议
+           hid("d", 0x3654, 0x6901, 0xFF02, 65, 65),       # 已在面板里
+           bt]
+    got = md.addable_devices(ifs, [{"vid": 0x3654, "pid": 0x6901, "name": ""}])
+    assert [(g["vid"], g["supported"]) for g in got] == [
+        (0x373B, True), (0x5555, True), (0x9999, False)], got
+    assert got[0]["name"] == "ATK A9 Air 大师+"
+    assert got[2]["name"] == "Zeta Receiver"
+
+
 # -- 导入设备规格（声明式适配器，带真机样本） ----------------------------------------
 GOOD_SPEC = {"name": "示例 鼠标", "kind": "mouse", "ids": [["ABCD", "0001"]],
              "page": "0xFF02", "lens": {"in": 17, "out": 17},

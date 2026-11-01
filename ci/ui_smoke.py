@@ -63,7 +63,7 @@ def make_app(light, snap):
         _refreshing=False, _lock=threading.Lock(), _readings=snap,
         refresh=lambda: None, remove_device=lambda k: None,
         rename_device=lambda k, t: None, quit=lambda: None, interval=60,
-        add_device=lambda *a: None, _add_win=None)
+        add_device=lambda *a: None, _add_win=None, devices=[])
 
 
 def pump(root, seconds):
@@ -147,6 +147,27 @@ for light in (False, True):
                 record(p.root, box, "anim_hover_toggle_dark", 0.7)
                 p._hover_card("a", False)
                 pump(p.root, 0.3)
+            real_enum = md.enumerate_hid
+            md.enumerate_hid = lambda: [
+                md.HidIface("p1", 0x373B, 0x1278, 0xFF02, 2, 17, 17, 0,
+                            "Wireless mouse 8k dongle-L"),
+                md.HidIface("p2", 0x046D, 0xC547, 0xFF00, 2, 20, 20, 0,
+                            "USB Receiver"),
+                md.HidIface("p3", 0x9999, 0x0001, 0xFF00, 1, 64, 64, 0,
+                            "2.4G Wireless Receiver")]
+            try:
+                p.open_picker()
+                pump(p.root, 0.9)
+                if not p._picker or not p._picker.items:
+                    errors.append("add-device picker listed no devices")
+                else:
+                    grab(p._picker.root, f"picker_{tag}")
+                    p._picker.close()
+                    pump(p.root, 0.3)
+            finally:
+                md.enumerate_hid = real_enum
+            p.show()
+            pump(p.root, 0.5)
             p.open_help("d")
             pump(p.root, 0.9)
             grab(p._help_win.root, f"help_{tag}")

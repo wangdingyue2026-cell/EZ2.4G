@@ -2763,6 +2763,35 @@ def device_info_text(r: "Reading", ifaces=None) -> str:
     return "\n".join(lines)
 
 
+def addable_devices(ifaces: list, devices: list) -> list:
+    """「添加设备」窗口的候选：插着、还没在面板里的接收器。
+
+    能读电量的（有适配器认领或已保存协议）排在前面；其余只列出带厂商自定义接口的
+    设备（2.4G 接收器基本都有），普通有线键鼠、摄像头等不会出现；蓝牙设备另有自动显示，不列。"""
+    have = {(int(d["vid"]), int(d["pid"])) for d in devices}
+    saved = user_protocols()
+    groups: dict = {}
+    for d in ifaces:
+        if d.instance.upper().startswith(("BTHENUM", "BTHLE")):
+            continue
+        groups.setdefault((d.vid, d.pid), []).append(d)
+    out = []
+    for (vid, pid), cand in groups.items():
+        if (vid, pid) in have:
+            continue
+        found = adapters_for(cand)
+        supported = bool(found) or f"{vid:04X}:{pid:04X}" in saved
+        if not supported and not any(d.usage_page >= 0xFF00 for d in cand):
+            continue
+        prod = next((d.product for d in cand if d.product), "")
+        name = (found[0].model_name(cand) if found
+                else prod or f"未知设备 {vid:04X}:{pid:04X}")
+        out.append({"vid": vid, "pid": pid, "name": name,
+                    "supported": supported})
+    out.sort(key=lambda x: (not x["supported"], x["name"].lower()))
+    return out
+
+
 def export_protocols_text(keys=None) -> str:
     """导出协议为 JSON 文本；标准 HID 协议不用分享，跳过。"""
     names = {f"{d['vid']:04X}:{d['pid']:04X}": d.get("name", "")
@@ -3818,7 +3847,7 @@ GLYPH = {
     "settings": "", "info": "", "bolt": "",
     "bluetooth": "", "hide": "",
     "import": "", "export": "",
-    "edit": "", "done": "",
+    "edit": "", "done": "", "add": "",
 }
 
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
@@ -5369,6 +5398,166 @@ class AddDeviceWindow(_Fluent):
         self._close_anim(finish)
 
 
+class AddPickerWindow(_Fluent):
+    """「添加设备」：列出插着、还没在面板里的接收器，点一下就添加，不用插拔。"""
+
+    LW = 420
+    ROW = 64
+    MAX_ROWS = 6
+
+    def __init__(self, panel):
+        self.panel = panel
+        self.app = panel.app
+        self._closed = False
+        self._added = set()
+        self.items = self._scan()
+        rows = max(1, min(len(self.items), self.MAX_ROWS))
+        self.LH = 96 + rows * self.ROW + (rows - 1) * 6 + 24 + 72
+        self._new_window(panel.root, "添加设备", self.app.theme_light,
+                         self.LW, self.LH)
+        self.cv.bind("<Button-1>", lambda e: self._drag_press(
+            e, 52, ("btn_",)))
+        self.cv.bind("<B1-Motion>", self._drag_move)
+        self.cv.bind("<ButtonRelease-1>",
+                     lambda e: setattr(self, "_drag", None))
+        self.root.bind("<Escape>", lambda e: self.close())
+        x, y = self._center_on_work_area()
+        self.root.update_idletasks()
+        apply_fluent_frame(self.root, self.W, self.H, self._px(8),
+                           self.c["stroke"])
+        self.shadow = None
+        if not IS_WIN11:
+            try:
+                self.shadow = ShadowWindow(self)
+            except Exception:
+                self.shadow = None
+        self.render()
+        self._open_anim(x, y)
+        try:
+            self.root.focus_force()
+        except Exception:
+            pass
+
+    def _scan(self) -> list:
+        try:
+            ifaces = enumerate_hid()
+        except Exception:
+            ifaces = []
+        return addable_devices(ifaces, self.app.devices)
+
+    def render(self):
+        c = self.c
+        cv = self.cv
+        cv.delete("all")
+        self._btns = {}
+        W, H = self.LW, self.LH
+        fy = H - 72
+        cv.create_image(0, 0, anchor="nw", image=self._grad(W, 0, fy, fy))
+        self._ctext(24, 32, "添加设备", c["text"], self._f(15, True),
+                    anchor="w")
+        self._ctext(24, 58, "这台电脑上插着、还没在面板里的接收器", c["sub"],
+                    self._f(10), anchor="w")
+        self._button(W - 46, 0, 46, 32, GLYPH["close"], self.close,
+                     kind="close", tag="btn_close", glyph=True, size=10)
+        y = 84
+        if not self.items:
+            cv.create_image(24, y, anchor="nw", image=self._rr(
+                W - 48, self.ROW, 6, c["card"], c["stroke_top"],
+                c["stroke_bot"]))
+            self._ctext(W / 2, y + 22, "没有找到可以添加的设备", c["text"],
+                        self._f(11, True))
+            self._ctext(W / 2, y + 44, "插上 2.4G 接收器后，点下面的「重新查找」",
+                        c["sub"], self._f(9))
+        for i, it in enumerate(self.items[:self.MAX_ROWS]):
+            self._row(24, y, W - 48, it, i)
+            y += self.ROW + 6
+        more = len(self.items) - self.MAX_ROWS
+        if more > 0:
+            self._ctext(24, fy - 14, f"还有 {more} 个设备没列出，先添加上面的再重新查找",
+                        c["dim"], self._f(9), anchor="w")
+        cv.create_rectangle(0, fy, W, H, fill=_rgb(c["footer"]), outline="")
+        cv.create_line(0, fy, W, fy, fill=_rgb(c["divider"]),
+                       width=self._px(1))
+        bw = (W - 48 - 8) / 2
+        self._button(24, fy + 20, bw, 32, "重新查找", self.rescan,
+                     tag="btn_rescan")
+        self._button(24 + bw + 8, fy + 20, bw, 32, "完成", self.close,
+                     kind="accent", tag="btn_done")
+        cv.scale("all", 0, 0, self.S, self.S)
+
+    def _row(self, x, y, w, it, i):
+        c = self.c
+        cv = self.cv
+        cv.create_image(x, y, anchor="nw", image=self._rr(
+            w, self.ROW, 6, c["card"], c["stroke_top"], c["stroke_bot"]))
+        cy = y + self.ROW / 2
+        ok = it["supported"]
+        well = _mix(c["card"], c["ok"] if ok else c["dim"], 0.16)
+        cv.create_image(x + 12, cy - 18, anchor="nw", image=self._disc(36, well))
+        self._ctext(x + 30, cy, _device_glyph(it["name"]), c["text"],
+                    self._fi(15))
+        key = (it["vid"], it["pid"])
+        added = key in self._added
+        bw = 72
+        self._ctext(x + 60, cy - 10, self._fit(it["name"], self._f(11, True),
+                                               w - 60 - bw - 24),
+                    c["text"], self._f(11, True), anchor="w")
+        sub = ("能读取电量" if ok else "暂不支持读取电量") + \
+            f" · {it['vid']:04X}:{it['pid']:04X}"
+        self._ctext(x + 60, cy + 11, sub, c["ok"] if ok else c["sub"],
+                    self._f(9), anchor="w")
+        self._button(x + w - 12 - bw, cy - 15, bw, 30,
+                     "已添加" if added else "添加",
+                     lambda it=it: self.add(it),
+                     kind="accent" if ok and not added else "standard",
+                     enabled=not added, tag=f"btn_add_{i}", size=10)
+
+    def add(self, it):
+        try:
+            self.app.add_device(it["vid"], it["pid"], it["name"])
+        except Exception:
+            pass
+        self._added.add((it["vid"], it["pid"]))
+        self.render()
+
+    def rescan(self):
+        self.items = self._scan()
+        self._added = set()
+        rows = max(1, min(len(self.items), self.MAX_ROWS))
+        lh = 96 + rows * self.ROW + (rows - 1) * 6 + 24 + 72
+        if lh != self.LH:
+            self.LH = lh
+            self.H = self._px(lh)
+            self.cv.configure(height=self.H)
+            self.root.geometry(f"{self.W}x{self.H}")
+            apply_fluent_frame(self.root, self.W, self.H, self._px(8),
+                               self.c["stroke"])
+        self.render()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self.panel._picker = None
+        if self._added and not self.app.panel_only:
+            try:
+                self.panel.show()
+            except Exception:
+                pass
+
+        def finish():
+            try:
+                if self.shadow:
+                    self.shadow.destroy()
+            except Exception:
+                pass
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+        self._close_anim(finish)
+
+
 class FluentMenu(_Fluent):
     """卡片右键菜单。items: [(glyph, 文字, 回调) | None(分隔线)]。"""
 
@@ -5482,7 +5671,7 @@ class Panel(_Fluent):
     CARD_H = 68
     GAP = 6
     MAX_ROWS = 5
-    EMPTY_H = 156
+    EMPTY_H = 210
     RING = 44
 
     def __init__(self, app: "TrayApp"):
@@ -5523,6 +5712,7 @@ class Panel(_Fluent):
         self._menu = None
         self._modal = False
         self._editing = False
+        self._picker = None
         self._scroll = 0.0
         self._render_scroll = 0.0
         self._max_scroll = 0.0
@@ -5746,6 +5936,12 @@ class Panel(_Fluent):
     def close(self):
         self._close_help()
         self._close_menu()
+        if self._picker is not None:
+            try:
+                self._picker.root.destroy()
+            except Exception:
+                pass
+            self._picker = None
         if self.shadow:
             try:
                 self.shadow.destroy()
@@ -5889,6 +6085,11 @@ class Panel(_Fluent):
                          GLYPH["done"] if self._editing else GLYPH["edit"],
                          self._toggle_edit, kind="subtle", tag="btn_edit",
                          glyph=True, size=13)
+        if n and not self._editing:
+            bx -= 36
+            self._button(bx, 13, 32, 32, GLYPH["add"], self.open_picker,
+                         kind="subtle", tag="btn_add_device", glyph=True,
+                         size=13)
 
         # 底栏
         cv.create_rectangle(0, foot_y, W, LH, fill=_rgb(c["footer"]),
@@ -6187,16 +6388,18 @@ class Panel(_Fluent):
                                        c["stroke_top"], c["stroke_bot"]))
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
-        cv.create_image(cx - 28, cy - 58, anchor="nw",
+        cv.create_image(cx - 28, cy - 88, anchor="nw",
                         image=self._disc(56, _mix(c["card"], c["accent"],
                                                   0.14)))
-        icon = self._ctext(cx, cy - 30, GLYPH["device"], c["link"],
+        icon = self._ctext(cx, cy - 60, GLYPH["device"], c["link"],
                            self._fi(24))
-        self._bob = (icon, cy - 30)
-        self._ctext(cx, cy + 16, "没有设备", c["text"], self._f(12, True))
-        self._ctext(cx, cy + 40, "插入或重新拔插 2.4G 接收器即可添加",
-                    c["sub"], self._f(10))
-        self._link(cx, cy + 62, "有别人分享的协议文件？点这里导入",
+        self._bob = (icon, cy - 60)
+        self._ctext(cx, cy - 14, "还没有设备", c["text"], self._f(12, True))
+        self._ctext(cx, cy + 10, "支持的设备插上会自动出现", c["sub"],
+                    self._f(10))
+        self._button(cx - 64, cy + 30, 128, 32, "添加设备", self.open_picker,
+                     kind="accent", tag="btn_empty_add", size=10)
+        self._link(cx, cy + 82, "有别人分享的协议文件？点这里导入",
                    self.import_protocol, "btn_empty_import", size=9,
                    anchor="center")
 
@@ -6436,6 +6639,21 @@ class Panel(_Fluent):
         finally:
             self._modal = False
 
+    def open_picker(self):
+        """「添加设备」窗口；打开时面板先收起，关掉后再弹出来看到新设备。"""
+        self._close_menu()
+        old = self._picker
+        if old is not None:
+            try:
+                old.root.lift()
+                old.root.focus_force()
+            except Exception:
+                pass
+            return
+        self._picker = AddPickerWindow(self)
+        if not self.app.panel_only:
+            self._withdraw()
+
     def _toggle_edit(self):
         self._editing = not self._editing and bool(self.app.snapshot())
         self.render()
@@ -6454,7 +6672,7 @@ class Panel(_Fluent):
         else:
             title, msg = "删除设备", (
                 f"从面板里删除「{name}」？\n\n之后插上也不会再自动添加；想加回来，"
-                "重新拔插接收器，在弹窗里点「添加」。")
+                "点面板右上角的「+」，在列表里选它。")
         self._modal = True
         try:
             ok = messagebox.askyesno(title, msg, parent=self.root)
