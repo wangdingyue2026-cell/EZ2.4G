@@ -5211,7 +5211,8 @@ class Panel(_Fluent):
         ring = cv.create_image(cx - D / 2, cy - D / 2, anchor="nw",
                                image=self._img(self._spec_hero_ring(start)))
         ncol = c["text"] if pick and not pick.stale else c["sub"]
-        num = self._ctext(cx - 5, cy - 5, "--" if lv is None else str(start),
+        num = self._ctext(cx if lv is None else cx - 5, cy - 5,
+                          "--" if lv is None else str(start),
                           ncol if lv is not None else c["dim"],
                           self._fn(36))
         pct = self._ctext(cx + 22, cy - 13, "%", c["sub"], self._fn(12),
