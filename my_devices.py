@@ -3,10 +3,14 @@
 """
 外设电量 —?Windows 10/11 无线外设电量托盘工具
 
-纯标准库 + ctypes + tkinter，零第三方依赖?
-用法?    python my_devices.py              # 托盘 + 简洁面板?    python my_devices.py --once       # 读一次并打印
+纯标准库 + ctypes + tkinter，零第三方依赖。
+
+用法：
+    python my_devices.py              # 托盘 + 电量面板
+    python my_devices.py --once       # 读一次并打印
     python my_devices.py --list       # 列出的 HID 接口
-    python my_devices.py --panel      # 打开面板（不常驻托盘?    python my_devices.py --install    # 创建开机自启?+ 桌面入口
+    python my_devices.py --panel      # 只开面板（不常驻托盘）
+    python my_devices.py --install    # 创建开机自启 + 桌面入口
 """
 from __future__ import annotations
 
@@ -218,7 +222,8 @@ HIDP_OUTPUT = 1
 HIDP_FEATURE = 2
 
 # ===========================================================================
-# HID 枚举与?# ===========================================================================
+# HID 枚举与读写
+# ===========================================================================
 
 
 @dataclasses.dataclass
@@ -276,7 +281,7 @@ def enumerate_hid() -> list[HidIface]:
                     hdev, ctypes.byref(did), buf, need.value,
                     ctypes.byref(need), None):
                 continue
-            # DevicePath ?cbSize(DWORD) 之后：偏?4
+            # DevicePath 在 cbSize(DWORD) 之后：偏移 4
             path = ctypes.wstring_at(ctypes.addressof(buf) + 4)
             inst = ctypes.create_unicode_buffer(512)
             inst_len = wt.DWORD(0)
@@ -325,8 +330,10 @@ class OVERLAPPED(ctypes.Structure):
 
 
 class HidDevice:
-    """的 HID 接口?
-    读句柄终单狔 FILE_FLAG_OVERLAPPED 打开：绝不在同一句柄上并发阻?    ReadFile ?WriteFile/IOCTL（实测会直接进程）?    """
+    """打开一个 HID 接口。
+    读句柄始终单独以 FILE_FLAG_OVERLAPPED 打开：绝不在同一句柄上并发阻塞
+    ReadFile 与 WriteFile/IOCTL（实测会直接卡死进程）。
+    """
 
     def __init__(self, path: str, write: bool = False):
         self.path = path
@@ -403,6 +410,13 @@ class HidDevice:
         buf = ctypes.create_string_buffer(data, len(data))
         return bool(hid.HidD_SetFeature(self.h, buf, len(data)))
 
+    def get_input_report(self, report_id: int, length: int) -> Optional[bytes]:
+        buf = ctypes.create_string_buffer(length)
+        ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte))[0] = report_id & 0xFF
+        if hid.HidD_GetInputReport(self.h, buf, length):
+            return bytes(buf.raw[:length])
+        return None
+
     def set_output_report(self, data: bytes) -> bool:
         buf = ctypes.create_string_buffer(data, len(data))
         return bool(hid.HidD_SetOutputReport(self.h, buf, len(data)))
@@ -446,110 +460,6 @@ class HidDevice:
 
 
 # ===========================================================================
-# 协议：CRC / JL_RCSP / ATK
-# ===========================================================================
-def crc16_ccitt(data: bytes) -> int:
-    crc = 0xFFFF
-    for b in data:
-        crc ^= b << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
-    return crc
-
-
-def build_jl_frame(seq: int, payload: bytes, report_id: int = 0x00,
-                   include_zero: bool = True, ch: int = 0x10,
-                   sub: int = 0x02, total: int = 64) -> bytes:
-    """杰理 JL_RCSP 帧?
-    include_zero=True  ?帧体?0x00 头（?Report ID 设备?65 字节报文?    include_zero=False ?Report ID 占字节，帧体从 0xFE ?    """
-    f = bytearray(total)
-    f[0] = report_id
-    base = 1
-    if include_zero:
-        f[base] = 0x00
-        base += 1
-    start = base
-    f[base] = 0xFE
-    f[base + 1] = seq & 0xFF
-    f[base + 2] = ch
-    f[base + 3] = 0x00
-    f[base + 4] = sub
-    f[base + 5] = 0x00
-    f[base + 6] = 0x00
-    f[base + 7] = len(payload) & 0xFF
-    f[base + 8] = (len(payload) >> 8) & 0xFF
-    f[base + 9:base + 9 + len(payload)] = payload
-    crc = crc16_ccitt(bytes(f[start:base + 9 + len(payload)]))
-    f[base + 9 + len(payload)] = (crc >> 8) & 0xFF
-    f[base + 10 + len(payload)] = crc & 0xFF
-    return bytes(f)
-
-
-@dataclasses.dataclass
-class JLFrame:
-    seq: int
-    ch: int
-    sub: int
-    payload: bytes
-    crc_ok: bool
-    raw: bytes
-
-    def tlvs(self):
-        out, i, p = [], 0, self.payload
-        while i + 2 <= len(p):
-            t, ln = p[i], p[i + 1]
-            out.append((t, p[i + 2:i + 2 + ln]))
-            i += 2 + ln
-        return out
-
-
-def parse_jl_frame(report: bytes) -> Optional[JLFrame]:
-    """在报文里找 0xFE 帧头（允许前 1~3 字节的 Report ID / 0x00）。"""
-    for start in range(0, 4):
-        if start + 12 > len(report):
-            break
-        if report[start] != 0xFE:
-            continue
-        ln = report[start + 7] | (report[start + 8] << 8)
-        if ln > 60 or start + 9 + ln + 2 > len(report):
-            continue
-        payload = report[start + 9:start + 9 + ln]
-        crc = (report[start + 9 + ln] << 8) | report[start + 10 + ln]
-        return JLFrame(seq=report[start + 1], ch=report[start + 2],
-                       sub=report[start + 4], payload=payload,
-                       crc_ok=(crc == crc16_ccitt(report[start:start + 9 + ln])),
-                       raw=report)
-    return None
-
-
-ATK2_PAYLOAD = bytes([0x7D, 0x72, 0x02, 0x00, 0x01, 0x07, 0x01])
-ATK1_PAYLOAD = bytes([0x04] + [0x00] * 15)  # 16 字节命令，cmd[15] 由校验?
-
-def atk1_checksum(report_id: int, cmd: bytes) -> int:
-    """ATK 16 字节命令：sum(REPORT_ID + cmd[0..14])，校验 = (0x55 - sum) & 0xFF。"""
-    total = report_id + sum(cmd[:15])
-    return (0x55 - (total & 0xFF)) & 0xFF
-
-
-def atk_request2(report_id: int = 0x08, total: int = 64) -> bytes:
-    body = bytes([report_id]) + ATK2_PAYLOAD
-    return body + bytes(total - len(body))
-
-
-def atk_request1(report_id: int = 0x08, total: int = 17) -> bytes:
-    cmd = bytearray(ATK1_PAYLOAD)
-    cmd[15] = atk1_checksum(report_id, bytes(cmd))
-    body = bytes([report_id]) + bytes(cmd)
-    return body + bytes(max(0, total - len(body)))
-
-
-def atk1_valid(rep: bytes) -> bool:
-    if len(rep) < 17 or rep[0] != 0x08 or rep[1] != 0x04:
-        return False
-    return (sum(rep[:16]) + rep[16]) & 0xFF == 0x55
-
-
-# ===========================================================================
 # 读取结果
 # ===========================================================================
 @dataclasses.dataclass
@@ -583,7 +493,8 @@ def _clamp(v, lo=0, hi=100):
 
 
 # ===========================================================================
-# 各策略?# ===========================================================================
+# 标准 HID 电量
+# ===========================================================================
 def read_standard_battery(iface: HidIface) -> Optional[Reading]:
     if not iface.feature_len:
         return None
@@ -594,7 +505,7 @@ def read_standard_battery(iface: HidIface) -> Optional[Reading]:
             if (cap.UsagePage, usage) not in ((0x0006, 0x0020), (0x000D, 0x003B),
                                               (0x0085, 0x0065)):
                 continue
-            rep = dev.get_feature(cap.ReportID or iface.feature_len)
+            rep = dev.get_feature_report(cap.ReportID, iface.feature_len)
             if not rep:
                 continue
             val = dev.usage_value(HIDP_FEATURE, rep, cap)
@@ -610,421 +521,9 @@ def read_standard_battery(iface: HidIface) -> Optional[Reading]:
     return None
 
 
-def atk_read_at(iface: HidIface, kind: str) -> Reading:
-    total = iface.output_len or (64 if kind == "atk2" else 17)
-    if kind == "atk2":
-        if total < 64:
-            return Reading(ok=False, source="ATK 协议 2",
-                           detail=f"输出报文只有 {total} 字节，不是 64 字节接口")
-        req, want = atk_request2(0x08, total), 64
-    else:
-        if total < 17:
-            return Reading(ok=False, source="ATK 协议 1",
-                           detail=f"输出报文只有 {total} 字节")
-        req, want = atk_request1(0x08, total), 17
-    dev = HidDevice(iface.path, write=True)
-    try:
-        last = b""
-        for _ in range(3):
-            dev.drain()
-            dev.write_output(req)
-            deadline = time.monotonic() + 0.8
-            while time.monotonic() < deadline:
-                rep = dev.read_input(max(want, iface.input_len), 250)
-                if not rep:
-                    continue
-                last = rep
-                if kind == "atk2":
-                    if len(rep) > 7 and rep[1] == 0x72 and rep[5] == 0x07:
-                        return Reading(ok=True, level=_clamp(rep[7]),
-                                       source="ATK 协议 2（0xFF05/64B）",
-                                       detail=f"回复 {rep[:12].hex(' ')}", raw=rep)
-                else:
-                    if atk1_valid(rep):
-                        wired = len(rep) > 7 and rep[7] != 0
-                        return Reading(ok=True, level=_clamp(rep[6]),
-                                       status="wired" if wired else "discharging",
-                                       source="ATK 协议（0xFF02/17B，0x55 校验）",
-                                       detail=f"电量字节=0x{rep[6]:02X} "
-                                              f"校验=0x{rep[16]:02X}", raw=rep)
-        return Reading(ok=False, source=f"ATK {kind}",
-                       detail=("设备没有给出有效回复（鼠标可能在休眠，动一下鼠标）"
-                               if not last else f"回复无效：{last[:12].hex(' ')}"))
-    except HidError as e:
-        return Reading(ok=False, source=f"ATK {kind}", detail=str(e))
-    finally:
-        dev.close()
-
-
-def mchose_read(iface: HidIface, timeout: float = 1.0) -> Reading:
-    """MCHOSE V9 Turbo（C-Media dongle）电量协议?
-    实测：向 Report ID 0x55 ?55 65 01 ...，回 55 65 <电量> <状态? ...
-    电量 = resp[2]?x3C = 60%）?    """
-    dev = HidDevice(iface.path, write=True)
-    try:
-        req = bytes([0x55, 0x65, 0x01]) + bytes(max(0, iface.output_len - 3))
-        dev.drain()
-        dev.write_output(req)
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            rep = dev.read_input(max(64, iface.input_len), 250)
-            if not rep or len(rep) < 3:
-                continue
-            if rep[0] == 0x55 and rep[1] == 0x65 and 0 <= rep[2] <= 100:
-                return Reading(ok=True, level=rep[2],
-                               source="MCHOSE 协议（0x55/0x65）",
-                               detail=f"回复 {rep[:8].hex(' ')}", raw=rep)
-        return Reading(ok=False, source="MCHOSE 协议",
-                       detail="没有收到 0x55/0x65 应答（耳机可能没开机）")
-    except HidError as e:
-        return Reading(ok=False, source="MCHOSE 协议", detail=str(e))
-    finally:
-        dev.close()
-
-
-def jl_read(iface: HidIface, seconds: float = 1.2) -> Reading:
-    """在 64 字节厂商接口上尝试杰理 TLV 协议，自动探测 Report ID。"""
-    dev = HidDevice(iface.path, write=True)
-    try:
-        ids = [0x55, 0x00]
-        for rid in range(0, 0x100):
-            if rid in ids:
-                continue
-            try:
-                if dev.set_output_report(bytes([rid]) + bytes(63)):
-                    ids.append(rid)
-                    break
-            except HidError:
-                continue
-        for rid in ids:
-            for include_zero in (True, False):
-                frame = build_jl_frame(0, b"\x01\x00", report_id=rid,
-                                       include_zero=include_zero, total=64)
-                try:
-                    dev.drain()
-                    dev.write_output(frame)
-                except HidError:
-                    continue
-                deadline = time.monotonic() + seconds
-                while time.monotonic() < deadline:
-                    rep = dev.read_input(64, 200)
-                    if not rep:
-                        continue
-                    fr = parse_jl_frame(rep)
-                    if not fr:
-                        continue
-                    for t, v in fr.tlvs():
-                        if t == 0x01 and v:
-                            return Reading(ok=True, level=_clamp(v[0]),
-                                           source="杰理 JL_RCSP（TLV 0x01）",
-                                           detail=f"ReportID=0x{rid:02X} "
-                                                  f"回复 {rep[:16].hex(' ')}", raw=rep)
-        return Reading(ok=False, source="杰理 JL_RCSP",
-                       detail="耳机没有上报电量（确认耳机已开机并与 dongle 连上）")
-    except HidError as e:
-        return Reading(ok=False, source="杰理 JL_RCSP", detail=str(e))
-    finally:
-        dev.close()
-
-
-def endgame_read(iface: HidIface) -> Optional[Reading]:
-    """Endgame Gear 无线鼠标（feature 0xA1，64 字节）。"""
-    if iface.vid != 0x3367 or iface.feature_len < 64:
-        return None
-    try:
-        dev = HidDevice(iface.path, write=True)
-    except HidError as e:
-        return Reading(ok=False, source="Endgame 协议", detail=str(e))
-    try:
-        for _ in range(3):
-            dev.set_feature(bytes([0xA1, 0xB4]) + bytes(62))
-            time.sleep(0.3)
-            rep = dev.get_feature_report(0xA1, 64)
-            if (rep and len(rep) > 17 and rep[1] == 0x01
-                    and 0 <= rep[16] <= 100):
-                return Reading(ok=True, level=rep[16],
-                               source="Endgame 协议（Feature 0xA1）",
-                               detail=f"原始 {rep[:20].hex(' ')}", raw=rep)
-        return Reading(ok=False, source="Endgame 协议",
-                       detail="没有有效回复（鼠标可能休眠）")
-    except HidError as e:
-        return Reading(ok=False, source="Endgame 协议", detail=str(e))
-    finally:
-        dev.close()
-
-
-def vaxee_read(iface: HidIface) -> Optional[Reading]:
-    """VAXEE / ZYGEN（feature 0x0E，电量以 5% 为长）?"""
-    if iface.vid != 0x3057 or iface.feature_len < 64:
-        return None
-    try:
-        dev = HidDevice(iface.path, write=True)
-    except HidError as e:
-        return Reading(ok=False, source="VAXEE 协议", detail=str(e))
-    try:
-        for _ in range(2):
-            dev.set_feature(bytes([0x0E, 0xA5, 0x0B, 0x01, 0x01]) + bytes(59))
-            time.sleep(0.15)
-            rep = dev.get_feature_report(0x0E, 64)
-            if rep and len(rep) > 5 and 0 <= rep[5] <= 20:
-                return Reading(ok=True, level=rep[5] * 5,
-                               source="VAXEE 协议（Feature 0x0E）",
-                               detail=f"原始 {rep[:10].hex(' ')}", raw=rep)
-        return Reading(ok=False, source="VAXEE 协议", detail="没有有效回复")
-    except HidError as e:
-        return Reading(ok=False, source="VAXEE 协议", detail=str(e))
-    finally:
-        dev.close()
-
-
-def nordic_read(iface: HidIface) -> Optional[Reading]:
-    """Nordic nRF 方案接收器（feature 0x05，32 字节）。"""
-    if iface.vid != 0x1915 or iface.feature_len < 32:
-        return None
-    try:
-        dev = HidDevice(iface.path, write=True)
-    except HidError as e:
-        return Reading(ok=False, source="Nordic 协议", detail=str(e))
-    try:
-        for _ in range(2):
-            dev.set_feature(bytes([0x05, 0x15, 0x00, 0x00, 0x01]) + bytes(27))
-            time.sleep(0.1)
-            rep = dev.get_feature_report(0x05, 32)
-            if rep and len(rep) > 9 and 0 <= rep[9] <= 100:
-                return Reading(ok=True, level=rep[9],
-                               source="Nordic 协议（Feature 0x05）",
-                               detail=f"原始 {rep[:12].hex(' ')}", raw=rep)
-        return Reading(ok=False, source="Nordic 协议", detail="没有有效回复")
-    except HidError as e:
-        return Reading(ok=False, source="Nordic 协议", detail=str(e))
-    finally:
-        dev.close()
-
-
-def _hidpp_call(dev: HidDevice, rid: int, devidx: int, featidx: int,
-                func: int, params: bytes, length: int,
-                timeout: float = 0.3) -> Optional[bytes]:
-    body = bytes([rid, devidx, featidx, ((func & 0x0F) << 4) | 0x01]) + params
-    body = (body + bytes(length))[:length]
-    dev.drain()
-    dev.write_output(body)
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        rep = dev.read_input(length, 100)
-        if not rep or len(rep) < 5:
-            continue
-        if rep[0] != rid or rep[1] != devidx or rep[2] != featidx:
-            continue
-        if ((rep[3] >> 4) & 0x0F) != func:
-            continue
-        return rep
-    return None
-
-
-def logitech_read(iface: HidIface) -> Optional[Reading]:
-    """罗技 HID++ 2.0?x1000 / 0x1004 / 0x1001）?"""
-    if iface.vid != 0x046D or iface.output_len < 7:
-        return None
-    rid = 0x11 if iface.output_len >= 20 else 0x10
-    length = 20 if rid == 0x11 else 7
-    try:
-        dev = HidDevice(iface.path, write=True)
-    except HidError as e:
-        return Reading(ok=False, source="罗技 HID++", detail=str(e))
-    try:
-        for devidx in (0xFF, 1, 2, 3, 4, 5, 6):
-            for fid, kind in ((0x1004, "unified"), (0x1000, "status"),
-                              (0x1001, "voltage")):
-                rep = _hidpp_call(dev, rid, devidx, 0x00, 0x00,
-                                  bytes([fid >> 8, fid & 0xFF]), length)
-                if not rep or (len(rep) > 3 and rep[3] & 0x80):
-                    continue
-                featidx = rep[4]
-                if not featidx:
-                    continue
-                rep = _hidpp_call(dev, rid, devidx, featidx, 0x00, b"", length)
-                if not rep or len(rep) < 6:
-                    continue
-                if kind == "unified":
-                    level, status = rep[4], rep[5]
-                    return Reading(ok=True, level=_clamp(level),
-                                   status="charging" if status in (1, 2, 4) else
-                                   ("full" if status == 3 else "discharging"),
-                                   source="罗技 HID++（0x1004 统一电池）",
-                                   detail=f"索引 {devidx} 状态?{status}", raw=rep)
-                if kind == "status" and len(rep) >= 7:
-                    level, status = rep[4], rep[6]
-                    return Reading(ok=True, level=_clamp(level),
-                                   status="charging" if status in (1, 2, 4) else
-                                   ("full" if status == 3 else "discharging"),
-                                   source="罗技 HID++（0x1000 电池状态）",
-                                   detail=f"索引 {devidx} 状态?{status}", raw=rep)
-                if kind == "voltage":
-                    mv = rep[4] | (rep[5] << 8)
-                    if 2000 <= mv <= 5000:
-                        return Reading(ok=False, source="罗技 HID++（0x1001 电压）",
-                                       detail=f"{mv} mV（该机型不直接给百分比）", raw=rep)
-        return Reading(ok=False, source="罗技 HID++", detail="没有找到电池特性")
-    except HidError as e:
-        return Reading(ok=False, source="罗技 HID++", detail=str(e))
-    finally:
-        dev.close()
-
-
-def listen_battery(iface: HidIface, seconds: float = 2.0) -> Optional[Reading]:
-    if not iface.input_len:
-        return None
-    try:
-        dev = HidDevice(iface.path, write=False)
-    except HidError:
-        return None
-    try:
-        caps = []
-        for cap in dev.value_caps(HIDP_INPUT):
-            usage = cap.u.NotRange.Usage if not cap.IsRange else cap.u.Range.UsageMin
-            if (cap.UsagePage, usage) == (0x0006, 0x0020):
-                caps.append(cap)
-        if not caps:
-            return None
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            rep = dev.read_input(iface.input_len, 250)
-            if not rep:
-                continue
-            for cap in caps:
-                val = dev.usage_value(HIDP_INPUT, rep, cap)
-                if val is not None:
-                    return Reading(ok=True, level=_clamp(val),
-                                   source="输入报告电量字段",
-                                   detail=f"原值={val}", raw=rep)
-        return Reading(ok=False, source="输入报告电量字段",
-                       detail="监听期间没有收到电量字段")
-    finally:
-        dev.close()
-
-
 # ===========================================================================
 # 设备服务
 # ===========================================================================
-@dataclasses.dataclass
-class DeviceSpec:
-    key: str
-    name: str
-    kind: str
-    ids: tuple
-
-
-DEVICES = [
-    DeviceSpec("mouse", "ATK Dragonfly A9 MINI", "atk",
-               ((0x373B, 0x1278), (0x373B, 0x128E),
-                (0x373B, 0x1216), (0x3554, 0x1216))),
-    DeviceSpec("headset", "MCHOSE V9 Turbo", "headset",
-               ((0x3837, 0x600D), (0x1837, 0x600D), (0x3654, 0x6901))),
-]
-
-
-def read_mouse(ifaces: list[HidIface]) -> Reading:
-    # 测试：临时忘记鼠标（VID/PID 与协讼
-    return Reading(ok=False, name="", source="", present=False,
-                   detail="已临时忘记该设备")
-    spec = DEVICES[0]
-    cands = [d for d in ifaces if (d.vid, d.pid) in spec.ids]
-    if not cands:
-        return Reading(ok=False, name=spec.name, source="", present=False,
-                       detail="没有找到 ATK Dragonfly A9 MINI（dongle 未插入？）")
-    for d in cands:
-        if d.usage_page == 0xFF05 and d.output_len >= 64:
-            r = atk_read_at(d, "atk2")
-            if r.ok:
-                return r
-    for d in cands:
-        if d.usage_page == 0xFF02 and d.output_len >= 17:
-            r = atk_read_at(d, "atk1")
-            if r.ok and r.level is not None:
-                return r
-    for d in cands:
-        if d.output_len >= 64:
-            r = atk_read_at(d, "atk2")
-            if r.ok:
-                return r
-    for d in cands:
-        r = read_standard_battery(d)
-        if r and r.ok:
-            return r
-    for d in cands:
-        r = listen_battery(d, 1.5)
-        if r and r.ok:
-            return r
-    return Reading(ok=False, name=spec.name, source="ATK 协议",
-                   detail="没有读到电量（鼠标可能休眠，动一下鼠标再试）")
-
-
-def read_headset(ifaces: list[HidIface]) -> Reading:
-    # 测试：临时忘记机（VID/PID 与协讼
-    return Reading(ok=False, name="", source="", present=False,
-                   detail="已临时忘记该设备")
-    spec = DEVICES[1]
-    cands = [d for d in ifaces if (d.vid, d.pid) in spec.ids]
-    if not cands:
-        return Reading(ok=False, name=spec.name, source="", present=False,
-                       detail="没有找到耳机 dongle（未插入？）")
-    vendor = [d for d in cands if d.output_len >= 64 and d.usage_page >= 0xFF00]
-    for d in vendor:
-        r = mchose_read(d)
-        if r.ok:
-            r.name = spec.name
-            return r
-    for d in vendor:
-        r = jl_read(d)
-        if r.ok:
-            r.name = spec.name
-            return r
-    for d in cands:
-        r = read_standard_battery(d)
-        if r and r.ok:
-            r.name = spec.name
-            return r
-    for d in cands:
-        r = listen_battery(d, 1.2)
-        if r and r.ok:
-            r.name = spec.name
-            return r
-    return Reading(ok=False, name=spec.name, source="杰理 JL_RCSP",
-                   detail="耳机没有上报电量（确认耳机已开机并与 dongle 连上）")
-
-
-def read_all(ifaces: Optional[list[HidIface]] = None) -> dict[str, Reading]:
-    ifaces = ifaces if ifaces is not None else enumerate_hid()
-    mouse = read_mouse(ifaces)
-    headset = read_headset(ifaces)
-    # 设备名统用接收器（HID Product String）上报的名字
-    for key, r in (("mouse", mouse), ("headset", headset)):
-        spec = DEVICES[0] if key == "mouse" else DEVICES[1]
-        if r.present:
-            prod = next((d.product for d in ifaces
-                         if (d.vid, d.pid) in spec.ids and d.product), "")
-            r.name = custom_names().get(key) or prod or spec.name
-        else:
-            r.name = ""
-        cand = [d for d in ifaces if (d.vid, d.pid) in spec.ids]
-        if cand:
-            meta = next((d for d in cand if d.usage_page >= 0xFF00), cand[0])
-            r.vid, r.pid, r.usage_page = (meta.vid, meta.pid,
-                                          meta.usage_page)
-            r.hid_known = True
-    out = {"mouse": mouse, "headset": headset}
-    try:
-        out.update(discover_extras(ifaces))
-    except Exception:
-        pass
-    return out
-
-
-def known_ids() -> set:
-    """不再按 VID/PID 匹配内置设备；统一走标准 HID 或抓包协议。"""
-    return set()
-
-
 def device_key(vid: int, pid: int) -> str:
     return f"x{vid:04X}{pid:04X}"
 
@@ -1128,106 +627,9 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
     return r
 
 
-def _unknown_reading(name: str, ifaces: list[HidIface],
-                     skip_compat: bool = False) -> Reading:
-    """对未记录设备做只读试掼失败则标记协讜知?"""
-    for d in ifaces:
-        try:
-            r = read_standard_battery(d)
-        except Exception:
-            r = None
-        if r and r.ok and r.level is not None:
-            r.name = name
-            r.source = "标准 HID 电量"
-            return r
-    if not skip_compat:
-        for d in ifaces:
-            try:
-                if d.usage_page == 0xFF02 and d.output_len >= 17:
-                    r = atk_read_at(d, "atk1")
-                elif d.output_len >= 64 and d.usage_page >= 0xFF00:
-                    r = mchose_read(d, timeout=0.6)
-                else:
-                    r = None
-            except Exception:
-                r = None
-            if r and r.ok and r.level is not None:
-                r.name = name
-                r.source = "兼容厂商协议"
-                return r
-        for fn in (endgame_read, vaxee_read, nordic_read, logitech_read):
-            for d in ifaces:
-                try:
-                    r = fn(d)
-                except Exception:
-                    r = None
-                if r is not None and r.ok and r.level is not None:
-                    r.name = name
-                    r.source = "厂商协议"
-                    return r
-    for d in ifaces[:2]:
-        if not d.input_len:
-            continue
-        try:
-            r = listen_battery(d, 0.6)
-        except Exception:
-            r = None
-        if r and r.ok and r.level is not None:
-            r.name = name
-            r.source = "Input 监听"
-            return r
-    return Reading(ok=False, present=True, name=name,
-                   status="unknown_proto", source="HID 通用",
-                   detail="协议未知，无法读取电量")
-
-
-def discover_extras(ifaces: list[HidIface]) -> dict[str, Reading]:
-    """把未记录的厂商 HID 设备（2.4G 接收器）聚合成额外卡片。"""
-    groups: dict[str, dict] = {}
-    known = known_ids()
-    for d in ifaces:
-        if (d.vid, d.pid) in known:
-            continue
-        if d.usage_page < 0xFF00:
-            continue
-        # 2.4G 接收器一定有多字节输入/输出报告；只有 Feature 的（触控板等）跳过
-        if not (d.output_len >= 2 or d.input_len >= 2):
-            continue
-        inst = (d.instance or "").upper()
-        prod = (d.product or "").upper()
-        if "HIDI2C" in inst or "ACPI" in inst or "HIDI2C" in prod:
-            continue
-        key = f"x{d.vid:04X}{d.pid:04X}"
-        g = groups.get(key)
-        if g is None:
-            g = {"name": d.product or f"未知设备 {d.vid:04X}:{d.pid:04X}",
-                 "ifaces": [], "vid": d.vid, "pid": d.pid}
-            groups[key] = g
-        g["ifaces"].append(d)
-    out: dict[str, Reading] = {}
-    for key, g in groups.items():
-        name = custom_names().get(key) or g["name"]
-        meta = next((d for d in g["ifaces"] if d.usage_page >= 0xFF00),
-                    g["ifaces"][0])
-        proto = user_protocols().get(f"{g['vid']:04X}:{g['pid']:04X}")
-        if proto:
-            r = _read_user_protocol(g["ifaces"], proto)
-            if r is not None:
-                r.name = name
-                r.vid, r.pid, r.usage_page = (meta.vid, meta.pid,
-                                              meta.usage_page)
-                r.hid_known = True
-                out[key] = r
-                continue
-        r = _unknown_reading(name, g["ifaces"], skip_compat=True)
-        r.name = name
-        r.vid, r.pid, r.usage_page = meta.vid, meta.pid, meta.usage_page
-        out[key] = r
-    return out
-
-
 # ---------------------------------------------------------------------------
-# 上成功读数缓存：备休?关机读不到时沿用，只有真正没插才显示朿?# ---------------------------------------------------------------------------
+# 上次成功读数缓存：设备休眠/关机读不到时沿用，只有真正没插才显示未连接
+# ---------------------------------------------------------------------------
 def _last_store() -> dict:
     cfg = load_config()
     last = cfg.get("last")
@@ -1291,7 +693,8 @@ def apply_last_known(res: dict[str, Reading]) -> dict[str, Reading]:
 
 
 # ===========================================================================
-# 主 / 注册?# ===========================================================================
+# 主题 / 注册表
+# ===========================================================================
 def reg_dword(path: str, name: str, default: int = 0) -> int:
     advapi32.RegGetValueW.argtypes = [ctypes.c_void_p, wt.LPCWSTR, wt.LPCWSTR,
                                       wt.DWORD, ctypes.POINTER(wt.DWORD),
@@ -1317,7 +720,8 @@ def is_light_theme() -> bool:
 
 
 # ===========================================================================
-# 图标（GDI 画电池，无需 Pillow?# ===========================================================================
+# 图标（GDI 画电量圆环，无需 Pillow）
+# ===========================================================================
 class BITMAPINFOHEADER(ctypes.Structure):
     _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
                 ("biPlanes", wt.WORD), ("biBitCount", wt.WORD),
@@ -1531,7 +935,8 @@ def make_battery_icon(level: Optional[int], light: bool,
         user32.ReleaseDC(None, hdc_screen)
 
 # ===========================================================================
-# 开机自启?/ 桌面链接 / 忍方式（纯 ctypes COM?# ===========================================================================
+# 开机自启 / 桌面链接 / 快捷方式（纯 ctypes COM）
+# ===========================================================================
 def _shell_folder(csidl: int) -> str:
     buf = ctypes.create_unicode_buffer(260)
     shell32.SHGetFolderPathW(None, csidl, None, 0, buf)
@@ -1731,7 +1136,8 @@ def install_desktop_links() -> list[str]:
 
 
 # ===========================================================================
-# 配置（只存刷新间隔；不是日志?# ===========================================================================
+# 配置（设备、协议、上次电量、刷新间隔；不是日志）
+# ===========================================================================
 def config_dir() -> str:
     base = os.environ.get("APPDATA") or project_dir()
     return os.path.join(base, "BatteryTray")
@@ -1790,69 +1196,25 @@ def user_protocols() -> dict:
     return v if isinstance(v, dict) else {}
 
 
+PROTO_KEYS = ("invert", "requests", "offset", "v", "req_kinds", "out_len",
+              "reply", "reply_id", "in_len", "match")
+
+
 def save_user_protocol(vid: int, pid: int, proto: dict) -> None:
     cfg = load_config()
     protos = cfg.get("protocols")
     if not isinstance(protos, dict):
         protos = {}
-    protos[f"{vid:04X}:{pid:04X}"] = {
-        "kind": "captured",
-        "invert": bool(proto.get("invert", False)),
-        "requests": list(proto.get("requests", [])),
-        "offset": int(proto.get("offset", 2)),
-    }
+    saved = {"kind": "captured"}
+    for k in PROTO_KEYS:
+        if k in proto:
+            saved[k] = proto[k]
+    saved["invert"] = bool(proto.get("invert", False))
+    saved["requests"] = list(proto.get("requests", []))
+    saved["offset"] = int(proto.get("offset", 2))
+    protos[f"{vid:04X}:{pid:04X}"] = saved
     cfg["protocols"] = protos
     save_config(cfg)
-
-
-def infer_generic(samples: list) -> dict:
-    """通用推断：两次不同电量抓包，找差值≈电量巚字节?
-    samples: [(电量, frames), ...]，frames ?[(ep, transfer, bytes)]?    """
-    if len(samples) < 2:
-        return None
-    down = []
-    up = []
-    for _lv, frames in samples[:2]:
-        rs = [d for ep, _tr, d in frames
-              if (ep & 0x80) and ep != 0x80 and len(d) >= 4]
-        os_ = [d for ep, _tr, d in frames
-               if not (ep & 0x80) and ep != 0 and len(d) >= 3]
-        down.append(rs)
-        for d in os_:
-            if d not in up:
-                up.append(d)
-    resp = down
-    reqs = up
-    if not requests_ok(reqs) or not resp[0] or not resp[1]:
-        return None
-    lv_a, lv_b = samples[0][0], samples[1][0]
-    delta = lv_b - lv_a
-    best = None
-    best_n = 0
-    for a in resp[0]:
-        for b in resp[1]:
-            if len(a) != len(b):
-                continue
-            for off in range(1, len(a) - 1):
-                if a[off] == lv_a and b[off] == lv_b:
-                    if abs((b[off] - a[off]) - delta) <= 2:
-                        n = 0
-                        for x in resp[0]:
-                            for y in resp[1]:
-                                if (len(x) == len(y) and len(x) > off
-                                        and x[off] == lv_a
-                                        and y[off] == lv_b):
-                                    n += 1
-                        if n > best_n:
-                            best_n = n
-                            best = off
-    if best is None:
-        return None
-    return {
-        "requests": [" ".join(f"{b:02X}" for b in d[:32])
-                     for d in reqs[:6]],
-        "offset": best,
-    }
 
 
 _DESCRIPTOR_PREFIXES = (
@@ -1928,35 +1290,79 @@ def _match_offsets(ins: list, level: int) -> set:
     return out
 
 
+# 抓包里合成的控制传输帧：transfer 字段标明来源，数据统一成 Windows 缓冲区布局
+# （首字节是报告 ID，设备不用 ID 时补 0），与 HidD_* 读写的缓冲区一一对应
+XFER_SET_OUTPUT = 0x12   # SET_REPORT(Output) 的报告本体
+XFER_SET_FEATURE = 0x13  # SET_REPORT(Feature) 的报告本体
+XFER_GET_INPUT = 0x21    # GET_REPORT(Input) 的回复
+XFER_GET_FEATURE = 0x23  # GET_REPORT(Feature) 的回复
+EP_CTRL_OUT = 0x0F       # 合成帧用的伪端点：非 0，不会被当成描述符过滤
+EP_CTRL_IN = 0x8F
+REQ_KIND = {XFER_SET_OUTPUT: "set_out", XFER_SET_FEATURE: "set_feat"}
+REPLY_KIND = {XFER_GET_INPUT: "get_input", XFER_GET_FEATURE: "feature"}
+
+
 def _requests_at(frames: list, ins: list, outs: list,
                  off: int, level: int) -> list:
+    """找出电量回复之前发出的请求帧，返回 [(字节, 类型)]，最多 6 条。"""
     reqs = []
+
+    def add(idx, d):
+        item = (d, REQ_KIND.get(frames[idx][1], "out"))
+        if item not in reqs:
+            reqs.append(item)
     oi = 0
     last_idx = -1
-    last = None
     for idx, d in ins:
         while oi < len(outs) and outs[oi][0] < idx:
-            last_idx, last = outs[oi][0], outs[oi][1]
+            last_idx = outs[oi][0]
             oi += 1
         if len(d) <= off or d[off] != level:
             continue
-        if last is not None and idx - last_idx <= 80 and last not in reqs:
-            reqs.append(last)
+        if last_idx >= 0 and idx - last_idx <= 80:
+            add(last_idx, frames[last_idx][2])
     if not reqs:
         prefixes = {d[:2] for _i, d in ins
                     if len(d) > off and d[off] == level}
-        reqs = [d for _i, d in outs if d[:2] in prefixes]
+        for i, d in outs:
+            if d[:2] in prefixes:
+                add(i, d)
     if not reqs:
-        reqs = [d for _i, d in outs]
+        for i, d in outs:
+            add(i, d)
     return reqs[:6]
 
 
-def _proto_at(reqs: list, off: int) -> dict:
-    return {
-        "requests": [" ".join(f"{b:02X}" for b in d[:32])
-                     for d in reqs[:6]],
+def _reply_info(frames: list, ins: list, off: int, level: int) -> dict:
+    """电量回复的形态：来源（输入报告 / GET_REPORT）、报告 ID、
+    线上长度，以及电量字节之前恒定不变的前两个字节（用于过滤别的报告）。"""
+    hits = [(i, d) for i, d in ins if len(d) > off and d[off] == level]
+    if not hits:
+        return {}
+    i0, d0 = hits[0]
+    kind = REPLY_KIND.get(frames[i0][1], "input")
+    info = {"reply": kind}
+    if kind == "input":
+        info["in_len"] = len(d0)
+    else:
+        info["reply_id"] = d0[0]
+    same = [d for i, d in hits
+            if REPLY_KIND.get(frames[i][1], "input") == kind]
+    info["match"] = [[p, d0[p]] for p in range(min(off, 2))
+                     if all(len(d) > p and d[p] == d0[p] for d in same)]
+    return info
+
+
+def _proto_at(reqs: list, off: int, reply: dict) -> dict:
+    proto = {
+        "v": 2,
+        "requests": [" ".join(f"{b:02X}" for b in d[:64]) for d, _k in reqs],
+        "req_kinds": [k for _d, k in reqs],
+        "out_len": max((len(d) for d, k in reqs if k == "out"), default=0),
         "offset": off,
     }
+    proto.update(reply)
+    return proto
 
 
 def infer_single_ex(level: int, frames: list):
@@ -1976,7 +1382,7 @@ def infer_single_ex(level: int, frames: list):
     reqs = _requests_at(frames, ins, outs, off, level)
     if not reqs:
         return None, "none"
-    return _proto_at(reqs, off), "ok"
+    return _proto_at(reqs, off, _reply_info(frames, ins, off, level)), "ok"
 
 
 def infer_two(level_a: int, frames_a: list,
@@ -2002,24 +1408,149 @@ def infer_two(level_a: int, frames_a: list,
     if len(candidates) > 1:
         return None, "ambiguous"
     off = candidates[0]
+    frames, ins, level = frames_a, ins_a, level_a
     reqs = _requests_at(frames_a, ins_a, outs_a, off, level_a)
     if not reqs:
+        frames, ins, level = frames_b, ins_b, level_b
         reqs = _requests_at(frames_b, ins_b, outs_b, off, level_b)
     if not reqs:
         return None, "none"
-    return _proto_at(reqs, off), "ok"
+    return _proto_at(reqs, off, _reply_info(frames, ins, off, level)), "ok"
 
 
-def infer_single(level: int, frames: list) -> dict:
-    return infer_single_ex(level, frames)[0]
+def _parse_requests(proto: dict) -> list:
+    """[(字节, 类型)]；旧协议没有类型，一律当中断 OUT。"""
+    raw = proto.get("requests")
+    if not isinstance(raw, list):
+        raw = [proto.get("request", "")]
+    kinds = proto.get("req_kinds")
+    if not isinstance(kinds, list):
+        kinds = []
+    out = []
+    for i, s in enumerate(raw):
+        try:
+            b = bytes.fromhex(str(s).replace(" ", ""))
+        except Exception:
+            continue
+        if len(b) >= 2:
+            out.append((b, kinds[i] if i < len(kinds) else "out"))
+    return out
 
 
-def requests_ok(reqs: list) -> bool:
-    return bool(reqs)
+def _reply_value(rep: Optional[bytes], off: int, shift: int, match: list):
+    """回复里取电量：返回 (电量, 严格匹配?)；不符合就返回 None。"""
+    if not rep or len(rep) <= off + shift:
+        return None
+    for n, (pos, val) in enumerate(match):
+        if len(rep) <= pos + shift or rep[pos + shift] != val:
+            if n == 0:
+                return None
+            v = rep[off + shift]
+            return (v, False) if 0 <= v <= 100 else None
+    v = rep[off + shift]
+    return (v, True) if 0 <= v <= 100 else None
+
+
+def _proto_reading(proto: dict, val: int, rep: bytes, how: str) -> Reading:
+    if proto.get("invert"):
+        val = 100 - val
+    return Reading(ok=True, level=val, source="抓包协议",
+                   detail=f"{how} {rep[:8].hex(' ')}", raw=rep)
 
 
 def _read_user_protocol(ifaces: list, proto: dict):
-    """用抓包得到的通用协议读一次电量（逐个尝试候求帧）?"""
+    """用抓包得到的协议读一次电量。v2 协议按记录的请求/回复形态回放，
+    旧协议走原来的“写 Output、读 Input”老路。"""
+    if proto.get("v", 1) >= 2:
+        return _read_v2_protocol(ifaces, proto)
+    return _read_legacy_protocol(ifaces, proto)
+
+
+def _read_v2_protocol(ifaces: list, proto: dict):
+    off = int(proto.get("offset", 2))
+    reqs = _parse_requests(proto)
+    if off < 1 or not reqs:
+        return None
+    reply = proto.get("reply", "input")
+    match = [tuple(m) for m in proto.get("match", []) if len(m) == 2]
+    in_len = int(proto.get("in_len", 0) or 0)
+    out_len = int(proto.get("out_len", 0) or 0)
+    rid = int(proto.get("reply_id", 0) or 0)
+    for req, kind in reqs:
+        for d in ifaces:
+            if kind == "set_feat":
+                if d.feature_len < len(req):
+                    continue
+                buf = req + bytes(d.feature_len - len(req))
+            elif kind == "set_out":
+                if d.output_len < len(req):
+                    continue
+                buf = req + bytes(d.output_len - len(req))
+            else:
+                # 线上帧比 Windows 输出缓冲区少 1 字节：设备不用报告 ID，补 0
+                full = out_len or len(req)
+                lead = b"\0" if full == d.output_len - 1 else b""
+                buf = lead + req
+                if d.output_len < len(buf):
+                    continue
+                buf += bytes(d.output_len - len(buf))
+            if reply == "input":
+                if d.input_len <= off:
+                    continue
+                shift = 1 if in_len and in_len == d.input_len - 1 else 0
+            elif reply == "feature":
+                if d.feature_len <= off:
+                    continue
+                shift = 0
+            else:
+                if d.input_len <= off:
+                    continue
+                shift = 0
+            dev = None
+            try:
+                dev = HidDevice(d.path, write=True)
+                if reply == "input":
+                    dev.drain()
+                if kind == "set_feat":
+                    if not dev.set_feature(buf):
+                        continue
+                elif kind == "set_out":
+                    if not dev.set_output_report(buf):
+                        continue
+                else:
+                    dev.write_output(buf)
+                loose = None
+                deadline = time.monotonic() + 1.2
+                while time.monotonic() < deadline:
+                    if reply == "input":
+                        rep = dev.read_input(max(64, d.input_len), 250)
+                    else:
+                        time.sleep(0.05)
+                        rep = (dev.get_feature_report(rid, d.feature_len)
+                               if reply == "feature" else
+                               dev.get_input_report(rid, d.input_len))
+                    got = _reply_value(rep, off, shift, match)
+                    if got is None:
+                        continue
+                    if got[1]:
+                        return _proto_reading(proto, got[0], rep, "回复")
+                    if loose is None:
+                        loose = (got[0], rep)
+                if loose is not None:
+                    return _proto_reading(proto, loose[0], loose[1], "回复")
+            except Exception:
+                pass
+            finally:
+                if dev is not None:
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+    return None
+
+
+def _read_legacy_protocol(ifaces: list, proto: dict):
+    """旧版抓包协议（没有 v 字段）：写 Output 报告、读 Input 报告。"""
     off = int(proto.get("offset", 2))
     if off < 1:
         return None
@@ -2071,6 +1602,44 @@ def _read_user_protocol(ifaces: list, proto: dict):
 
 
 def _listen_user_protocol(ifaces: list, proto: dict,
+                          seconds: float = 1.5):
+    """被动监听输入报告：不发请求，只看设备自己上报的字节。"""
+    if proto.get("v", 1) < 2:
+        return _listen_legacy_protocol(ifaces, proto, seconds)
+    if proto.get("reply", "input") != "input":
+        return None
+    off = int(proto.get("offset", 2))
+    match = [tuple(m) for m in proto.get("match", []) if len(m) == 2]
+    if off < 1 or not match:
+        return None  # 没有报告特征就不靠猜，宁可读不到也不读错
+    in_len = int(proto.get("in_len", 0) or 0)
+    for d in ifaces:
+        if d.input_len <= off:
+            continue
+        shift = 1 if in_len and in_len == d.input_len - 1 else 0
+        dev = None
+        try:
+            dev = HidDevice(d.path, write=False)
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                rep = dev.read_input(max(64, d.input_len), 250)
+                got = _reply_value(rep, off, shift, match)
+                if got is not None and got[1]:
+                    r = _proto_reading(proto, got[0], rep, "监听到报告")
+                    r.source = "被动监听输入报告"
+                    return r
+        except Exception:
+            pass
+        finally:
+            if dev is not None:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+    return None
+
+
+def _listen_legacy_protocol(ifaces: list, proto: dict,
                           seconds: float = 1.5):
     """被动监听输入报告：不发请求，只看设备自己上报的字节。"""
     off = int(proto.get("offset", 2))
@@ -2159,23 +1728,9 @@ def _validate_capture_protocol(proto: dict, vid: int, pid: int,
     return None, r
 
 
-def _verify_saved_protocol(vid: int, pid: int, proto: dict):
-    """保存协议后立即验证：先主动回读，失败再被动监听。"""
-    try:
-        ifaces = [d for d in enumerate_hid()
-                  if d.vid == vid and d.pid == pid]
-    except Exception:
-        ifaces = []
-    if not ifaces:
-        return None
-    r = _read_user_protocol(ifaces, proto)
-    if r and r.ok:
-        return r
-    return _listen_user_protocol(ifaces, proto)
-
-
-def _iter_pcap_packets(path: str):
-    """流式读取 USBPcap pcap，逐包产出 (bus, dev, ep, transfer, payload)。"""
+def _iter_pcap_ex(path: str):
+    """流式读取 USBPcap pcap，逐包产出
+    (bus, dev, ep, transfer, payload, info, stage)；stage 只有控制传输才有，否则 -1。"""
     try:
         f = open(path, "rb")
     except Exception:
@@ -2209,7 +1764,14 @@ def _iter_pcap_packets(path: str):
             payload = pkt[hlen:hlen + dlen]
             bus = struct.unpack_from("<H", pkt, 17)[0]
             dev = struct.unpack_from("<H", pkt, 19)[0]
-            yield bus, dev, pkt[21], pkt[22], payload
+            stage = pkt[27] if hlen >= 28 and pkt[22] == 2 else -1
+            yield bus, dev, pkt[21], pkt[22], payload, pkt[16], stage
+
+
+def _iter_pcap_packets(path: str):
+    """逐包产出 (bus, dev, ep, transfer, payload)。"""
+    for bus, dev, ep, tr, payload, _info, _stage in _iter_pcap_ex(path):
+        yield bus, dev, ep, tr, payload
 
 
 def scan_pcap_map(path: str) -> dict:
@@ -2235,29 +1797,69 @@ def scan_pcap_devices(path: str) -> list:
     return seen
 
 
+def _win_layout(report_id: int, body: bytes) -> bytes:
+    """控制传输的报告本体 → Windows HidD_* 缓冲区（首字节为报告 ID）。"""
+    if report_id and body[:1] == bytes((report_id,)):
+        return bytes(body)
+    return bytes((report_id,)) + bytes(body)
+
+
 def extract_pcap_reports(path: str, target: set = None,
                          limit: int = None) -> list:
-    """流式提取 HID 帧；target 为 {(bus, device)} 时只收目标设备。"""
+    """流式提取 HID 帧 [(ep, transfer, 数据)]；target 为 {(bus, device)} 时只收目标设备。
+    HID 类控制请求（SET_REPORT / GET_REPORT）合成为带 XFER_* 标记的帧，
+    兼容 setup 与数据同包、分包两种记录方式。"""
     out = []
-    for bus, dev, ep, transfer, payload in _iter_pcap_packets(path):
+    pending = {}
+
+    def add(frame):
+        if not out or out[-1][1:] != frame[1:]:
+            out.append(frame)
+        return bool(limit and len(out) >= limit)
+
+    for bus, dev, ep, transfer, payload, _info, stage in _iter_pcap_ex(path):
         if target is not None and (bus, dev) not in target:
             continue
+        key = (bus, dev)
+        if ep & 0x7F == 0:
+            if (stage in (0, -1) and len(payload) >= 8
+                    and payload[0] in (0x21, 0xA1)
+                    and payload[1] in (0x09, 0x01)):
+                setup = bytes(payload[:8])
+                rid, rtype = payload[2], payload[3]
+                wlen = payload[6] | (payload[7] << 8)
+                body = payload[8:8 + wlen]
+                if payload[1] == 0x09 and body:
+                    if rtype in (2, 3) and add((
+                            EP_CTRL_OUT, XFER_SET_OUTPUT if rtype == 2
+                            else XFER_SET_FEATURE, _win_layout(rid, body))):
+                        break
+                else:
+                    pending[key] = (payload[1], rid, rtype, wlen, setup)
+                continue
+            p = pending.get(key)
+            if p and payload:
+                req, rid, rtype, wlen, setup = p
+                body = payload[8:] if payload[:8] == setup else payload
+                body = body[:wlen]
+                if req == 0x09 and not ep & 0x80 and rtype in (2, 3):
+                    pending.pop(key, None)
+                    if body and add((EP_CTRL_OUT, XFER_SET_OUTPUT if rtype == 2
+                                     else XFER_SET_FEATURE,
+                                     _win_layout(rid, body))):
+                        break
+                    continue
+                if req == 0x01 and ep & 0x80 and rtype in (1, 3):
+                    pending.pop(key, None)
+                    if body and add((EP_CTRL_IN, XFER_GET_INPUT if rtype == 1
+                                     else XFER_GET_FEATURE,
+                                     _win_layout(rid, body))):
+                        break
+                    continue
         if len(payload) < 4:
             continue
-        # HID SET_REPORT 控制传输：把报告本体当作 OUT 帧
-        if (ep == 0 and len(payload) >= 10
-                and payload[0] == 0x21 and payload[1] == 0x09):
-            wlen = payload[6] | (payload[7] << 8)
-            report = payload[8:8 + wlen]
-            if len(report) >= 3 and (not out or out[-1][2] != report):
-                out.append((0x02, 1, report))
-            if limit and len(out) >= limit:
-                break
-            continue
-        if not out or out[-1][2] != payload:
-            out.append((ep, transfer, payload))
-            if limit and len(out) >= limit:
-                break
+        if add((ep, transfer, bytes(payload))):
+            break
     return out
 
 
@@ -2267,26 +1869,6 @@ def extract_pcap_for(path: str, vid: int, pid: int):
     targets = {k for k, v in mapping.items() if v == (vid, pid)} if vid else set()
     frames = extract_pcap_reports(path, targets or None)
     return frames, mapping
-
-
-def validate_protocol(proto: dict, vid: int, pid: int, level: int):
-    """用推断出的协议回读一次，必须与填入电量一致才允许保存。"""
-    try:
-        ifaces = [d for d in enumerate_hid()
-                  if d.vid == vid and d.pid == pid]
-    except Exception as e:
-        return False, f"枚举失败：{e}"
-    if not ifaces:
-        return False, "没有找到设备接口"
-    try:
-        r = _read_user_protocol(ifaces, proto)
-    except Exception as e:
-        return False, f"回读异常：{e}"
-    if not r or not r.ok or r.level is None:
-        return False, "回读失败"
-    if abs(int(r.level) - int(level)) <= 2:
-        return True, f"回读 {r.level}%"
-    return False, f"回读 {r.level}%，与填入 {level}% 不符"
 
 
 def format_reports(reports: list) -> str:
@@ -2316,10 +1898,21 @@ def set_custom_name(key: str, name: str) -> None:
 # ===========================================================================
 # CLI
 # ===========================================================================
+def read_saved_all(devices: Optional[list] = None) -> dict[str, Reading]:
+    """读一遍已添加的设备（托盘刷新与 --once 共用），没读到的沿用上次电量。"""
+    devices = load_saved_devices() if devices is None else devices
+    ifaces = enumerate_hid()
+    res = {device_key(d["vid"], d["pid"]): read_saved_device(d, ifaces)
+           for d in devices}
+    return apply_last_known(res)
+
+
 def print_once():
-    res = apply_last_known(read_all())
-    for key in ("mouse", "headset"):
-        r = res[key]
+    res = read_saved_all()
+    if not res:
+        print("还没有添加设备：先运行托盘程序，插入接收器后在弹窗里点「添加」。")
+        return
+    for r in res.values():
         if r.ok:
             suffix = f"；{r.detail}" if r.stale else f"（{r.source}）"
             print(f"{r.name}：{r.level}%{suffix}")
@@ -3030,7 +2623,7 @@ gdi32.DeleteDC.argtypes = [wt.HDC]
 
 
 class ShadowWindow:
-    """分层窗口：在面板背后画一圈向外渐隐的灰色光晕?"""
+    """分层窗口：在面板背后画一圈向外渐隐的灰色光晕（Win10 用）。"""
 
     def __init__(self, panel):
         self.panel = panel
@@ -5336,14 +4929,10 @@ class Tray:
         self.sync_icons()
 
     def sync_icons(self):
-        """按实际插入的接收器减托盘图标；七没有时清空托盘?"""
+        """按实际插入的接收器增减托盘图标；一个都没有时清空托盘。"""
         snap = self.app.snapshot()
-        known = [k for k in ("mouse", "headset")
-                 if snap.get(k) and snap[k].present]
-        extras = [k for k, r in snap.items()
-                  if k not in ("mouse", "headset") and r and r.present
-                  and r.ok and r.level is not None]
-        present = known + extras
+        present = [k for k, r in snap.items()
+                   if r and r.present and r.ok and r.level is not None]
         desired = {i + 1: k for i, k in enumerate(present[:4])}
         for uid in list(self.nids):
             if uid not in desired:
@@ -5380,8 +4969,7 @@ class Tray:
                 user32.DestroyIcon(old)
         else:
             nid.hIcon = old
-        name = (r.name if r and r.name else
-                (DEVICES[0].name if key == "mouse" else DEVICES[1].name))
+        name = (r.name if r and r.name else "设备")
         stamp = time.strftime("%H:%M", time.localtime(r.ts)) if r else "--:--"
         tip = (f"2.4G · {name}：{r.level}%（{stamp}）" if (r and r.ok)
                else f"2.4G · {name}：未连接（{stamp}）")
@@ -5391,7 +4979,7 @@ class Tray:
         self.sync_icons()
 
     def notify(self, text: str, title: str = "2.4G") -> bool:
-        """托盘气泡通知（Windows 通知丿也会收到），?64px 满绿玁图标?"""
+        """托盘气泡通知（Windows 通知中心也会收到），配 64px 满电圆环图标。"""
         nid = self.nids.get(1)
         if nid is None:
             return False
@@ -5402,7 +4990,8 @@ class Tray:
         if self._big_icon:
             nid.hIcon = self._big_icon
         nid.uFlags = NIF_INFO | NIF_ICON
-        nid.uVersion = 10000          # 10 ?        nid.szInfo = text[:255]
+        nid.uVersion = 10000          # 10 秒
+        nid.szInfo = text[:255]
         nid.szInfoTitle = title[:63]
         nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON
         nid.hBalloonIcon = self._big_icon
@@ -5537,12 +5126,7 @@ class TrayApp:
 
     def _worker(self):
         try:
-            ifaces = enumerate_hid()
-            res = {}
-            for dev in self.devices:
-                key = device_key(dev["vid"], dev["pid"])
-                res[key] = read_saved_device(dev, ifaces)
-            res = apply_last_known(res)
+            res = read_saved_all(self.devices)
         except Exception:
             res = {}
         with self._lock:
@@ -5554,7 +5138,7 @@ class TrayApp:
             user32.PostMessageW(self.tray.hwnd, WM_APP_REFRESH, 0, 0)
 
     def _check_full(self, res):
-        """电量首?100% 时弹?Windows 通知；掉?97% 以下重新布防?"""
+        """电量首次到 100% 时弹 Windows 通知；掉到 97% 以下重新布防。"""
         for key, r in res.items():
             if not r.ok or r.level is None or r.stale:
                 continue
@@ -5696,7 +5280,7 @@ class TrayApp:
         except Exception:
             pass
 
-    # -- 主循?------------------------------------------------------------
+    # -- 主循环 ------------------------------------------------------------
     def run(self):
         migrate_startup_link()
         self.panel = Panel(self)
@@ -5758,7 +5342,7 @@ APP_DISPLAY_NAME = "2.4G"
 
 
 def register_app_identity():
-    """?Windows 通知显示?2.4G Device，不?Python?"""
+    """让 Windows 通知显示为 2.4G，而不是 Python。"""
     try:
         import winreg
         path = r"Software\Classes\AppUserModelId\%s" % APP_ID

@@ -19,6 +19,9 @@ jobs:
       - name: Install build tools
         run: python -m pip install --upgrade pip pyinstaller==6.11.1 pillow
 
+      - name: Protocol tests (synthetic captures, fake HID device)
+        run: python ci/test_protocol.py my_devices.py
+
       - name: UI smoke test (render every window and screenshot it)
         run: python ci/ui_smoke.py my_devices.py screenshots
 
