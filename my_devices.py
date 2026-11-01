@@ -3019,46 +3019,30 @@ def accent_rgb() -> tuple:
 
 
 def fluent_colors(light: bool) -> dict:
-    acc = accent_rgb()
-    if light:
-        accent = _mix(acc, (0, 0, 0), 0.08)
-        return {
-            "bg": (243, 243, 245), "bg_top": _mix((249, 249, 251), acc, 0.04),
-            "bg_bot": (240, 240, 242), "footer": (234, 234, 236),
-            "divider": (222, 222, 224),
-            "card": (252, 252, 252), "card_hover": (246, 246, 247),
-            "stroke": (228, 228, 230), "stroke_top": (236, 236, 238),
-            "stroke_bot": (212, 212, 215), "shadow": 0.06,
-            "well": (238, 238, 240),
-            "text": (26, 26, 26), "sub": (96, 96, 96), "dim": (138, 138, 138),
-            "accent": accent, "accent_hover": _mix(accent, (255, 255, 255), 0.1),
-            "on_accent": (255, 255, 255), "link": _mix(acc, (0, 0, 0), 0.2),
-            "ok": (16, 137, 62), "warn": (202, 128, 0), "bad": (209, 52, 56),
-            "track": (226, 226, 228),
-            "ctl": (251, 251, 251), "ctl_hover": (246, 246, 246),
-            "ctl_stroke": (214, 214, 214), "ctl_off": (245, 245, 245),
-            "subtle_hover": (228, 228, 230),
-            "menu": (249, 249, 249), "menu_hover": (234, 234, 234),
-            "info": _mix((246, 246, 248), acc, 0.06),
-        }
-    accent = _mix(acc, (255, 255, 255), 0.45)
+    """科技风深色主题：深海军蓝底 + 电光青强调色。
+
+    不再跟随系统深浅色——面板、对话框、菜单统一用这一套；
+    托盘图标仍按任务栏深浅色绘制。参数保留，调用方不用改。"""
+    accent = (0, 214, 255)
     return {
-        "bg": (44, 44, 46), "bg_top": _mix((50, 50, 53), acc, 0.06),
-        "bg_bot": (38, 38, 40), "footer": (32, 32, 33), "divider": (24, 24, 25),
-        "card": (54, 54, 57), "card_hover": (63, 63, 66),
-        "stroke": (34, 34, 36), "stroke_top": (76, 76, 80),
-        "stroke_bot": (42, 42, 44), "shadow": 0.22,
-        "well": (70, 70, 73),
-        "text": (255, 255, 255), "sub": (204, 204, 206), "dim": (150, 150, 152),
-        "accent": accent, "accent_hover": _mix(accent, (0, 0, 0), 0.1),
-        "on_accent": (0, 0, 0), "link": accent,
-        "ok": (108, 203, 95), "warn": (252, 200, 0), "bad": (255, 120, 130),
-        "track": (76, 76, 80),
-        "ctl": (60, 60, 62), "ctl_hover": (68, 68, 70),
-        "ctl_stroke": (76, 76, 78), "ctl_off": (50, 50, 52),
-        "subtle_hover": (62, 62, 65),
-        "menu": (44, 44, 46), "menu_hover": (62, 62, 65),
-        "info": _mix((50, 50, 54), acc, 0.10),
+        "bg": (7, 10, 18), "bg_top": (12, 18, 32), "bg_bot": (7, 10, 18),
+        "footer": (9, 13, 23), "divider": (26, 36, 58),
+        "card": (15, 21, 35), "card_hover": (21, 30, 50),
+        "stroke": (38, 54, 84), "stroke_top": (52, 74, 112),
+        "stroke_bot": (22, 30, 48), "shadow": 0.5,
+        "well": (24, 32, 52),
+        "text": (236, 242, 255), "sub": (146, 160, 192), "dim": (86, 100, 130),
+        "accent": accent, "accent_hover": (110, 234, 255),
+        "accent2": (110, 92, 255),
+        "on_accent": (2, 12, 24), "link": (96, 226, 255),
+        "ok": (0, 236, 170), "warn": (255, 188, 46), "bad": (255, 72, 112),
+        "track": (28, 38, 60),
+        "ctl": (19, 27, 45), "ctl_hover": (27, 38, 62),
+        "ctl_stroke": (44, 60, 92), "ctl_off": (15, 21, 35),
+        "subtle_hover": (26, 36, 58),
+        "menu": (12, 17, 29), "menu_hover": (26, 36, 58),
+        "info": (11, 25, 42),
+        "grid": (22, 34, 56),
     }
 
 
@@ -3098,13 +3082,28 @@ def icon_font(root) -> str:
 
 
 def num_font(root) -> str:
+    """数字用 Bahnschrift（DIN 风格的仪表字体，Win10 起自带）。"""
     global _NUM_FONT
     if _NUM_FONT is None:
         fams = set(tkfont.families(root))
-        _NUM_FONT = next((f for f in ("Segoe UI Variable Display",
+        _NUM_FONT = next((f for f in ("Bahnschrift",
+                                      "Segoe UI Variable Display",
                                       "Segoe UI Variable Text", "Segoe UI")
                           if f in fams), FONT)
     return _NUM_FONT
+
+
+_MONO_FONT = None
+
+
+def mono_font(root) -> str:
+    """小号英文标签 / 编号用等宽字体。"""
+    global _MONO_FONT
+    if _MONO_FONT is None:
+        fams = set(tkfont.families(root))
+        _MONO_FONT = next((f for f in ("Cascadia Mono", "Consolas")
+                           if f in fams), FONT)
+    return _MONO_FONT
 
 
 # -- 纯 Python 抗锯齿光栅：生成 RGBA PNG 给 Tk 的 PhotoImage ---------------
@@ -3341,6 +3340,108 @@ def toggle_png(w: int, h: int, s: float, t: float, hover: bool,
     return _composite(w, h, layers)
 
 
+def backdrop_png(w: int, h: int, s: float, c: dict) -> str:
+    """面板顶部背景：竖直渐变 + 两团极光 + 蓝图网格，越往下越淡，
+    最底一行正好是 bg，和下面的纯色底无缝衔接。"""
+    top, bot, grid = c["bg_top"], c["bg"], c["grid"]
+    blobs = [(c["accent"], 0.84 * w, 0.10 * h, 0.62 * w, 0.20),
+             (c["accent2"], 0.10 * w, 0.0, 0.56 * w, 0.18)]
+    pitch = max(4, int(round(20 * s)))
+    lw = max(1, int(round(s)))
+    rows = []
+    for bc, bx, by, br, ba in blobs:
+        k = 1.0 / (br * br)
+        rows.append((bc, by, k, ba, [(x + 0.5 - bx) ** 2 * k
+                                      for x in range(w)]))
+    out = bytearray()
+    for y in range(h):
+        fy = y + 0.5
+        t = fy / h
+        fade = max(0.0, 1.0 - t) ** 1.6
+        base = _mix(top, bot, t)
+        r0, g0, b0 = base
+        weights = []
+        for bc, by, k, ba, xs in rows:
+            dy2 = (fy - by) ** 2 * k
+            weights.append((bc, ba * fade, dy2, xs))
+        gy = (y % pitch) < lw
+        ga = 0.55 * fade
+        row = bytearray(w * 4)
+        for x in range(w):
+            r, g, b = r0, g0, b0
+            for bc, a, dy2, xs in weights:
+                e = xs[x] + dy2
+                if e < 6.0:
+                    m = a * math.exp(-e * 2.2)
+                    r += (bc[0] - r) * m
+                    g += (bc[1] - g) * m
+                    b += (bc[2] - b) * m
+            if ga > 0.01 and (gy or (x % pitch) < lw):
+                r += (grid[0] - r) * ga
+                g += (grid[1] - g) * ga
+                b += (grid[2] - b) * ga
+            i = x * 4
+            row[i] = int(r + 0.5)
+            row[i + 1] = int(g + 0.5)
+            row[i + 2] = int(b + 0.5)
+            row[i + 3] = 255
+        out += row
+    return _png_b64(w, h, out)
+
+
+def logo_png(size: int, r: float, c1, c2) -> str:
+    """标题旁的小标志：圆角方块，左下到右上 c1→c2 斜向渐变。"""
+    h = size / 2.0
+    px = bytearray(size * size * 4)
+    for y in range(size):
+        for x in range(size):
+            a = _cov(_sd_rrect(x + 0.5, y + 0.5, h, h, h, h, r))
+            if a <= 0:
+                continue
+            col = _mix(c1, c2, (x + size - y) / (2.0 * size))
+            i = (y * size + x) * 4
+            px[i], px[i + 1], px[i + 2] = col
+            px[i + 3] = int(a * 255 + 0.5)
+    return _png_b64(size, size, px)
+
+
+def bezel_png(size: int, ring: int, thick: float, s: float, color,
+              tick, tick_major) -> str:
+    """大圆环外圈：柔光晕 + 60 格表盘刻度（每 5 格一根长刻度）。"""
+    c = size / 2.0
+    rm = (ring - thick) / 2.0
+    sig = 2.0 * (7.0 * s) ** 2
+    r1 = ring / 2.0 + 5.0 * s
+    hw = 0.5 * max(1.0, s)
+    step = 2 * math.pi / 60
+    px = bytearray(size * size * 4)
+    for y in range(size):
+        fy = y + 0.5 - c
+        for x in range(size):
+            fx = x + 0.5 - c
+            d = math.hypot(fx, fy)
+            ga = 0.34 * math.exp(-(d - rm) ** 2 / sig)
+            col, a = color, ga
+            if d >= r1 - 1:
+                ang = math.atan2(fx, -fy) % (2 * math.pi)
+                n = int(ang / step + 0.5)
+                major = n % 5 == 0
+                r2 = r1 + (7.0 if major else 3.5) * s
+                if d <= r2 + 1:
+                    da = abs(ang - n * step) * d
+                    k = _cov(da - hw) * _cov(r1 - d) * _cov(d - r2)
+                    if k > 0:
+                        tc = tick_major if major else tick
+                        col = _mix(col, tc, k / max(1e-6, k + a * (1 - k)))
+                        a = k + a * (1 - k)
+            if a < 0.004:
+                continue
+            i = (y * size + x) * 4
+            px[i], px[i + 1], px[i + 2] = col
+            px[i + 3] = min(255, int(a * 255 + 0.5))
+    return _png_b64(size, size, px)
+
+
 # -- 窗口外观 -----------------------------------------------------------------
 def set_round_region(hwnd: int, w: int, h: int, radius: int = 24) -> None:
     try:
@@ -3573,6 +3674,9 @@ class _Fluent:
 
     def _fn(self, size, bold=True):
         return self._f(size, bold, num_font(self.root))
+
+    def _fm(self, size, bold=False):
+        return self._f(size, bold, mono_font(self.root))
 
     # -- 图像 ----------------------------------------------------------------
     def _image(self, key, make):
@@ -4630,17 +4734,22 @@ class FluentMenu(_Fluent):
 
 
 class Panel(_Fluent):
-    """托盘弹出面板：仿 Windows 11 快速设置 / 电池浮出窗口。"""
+    """托盘弹出面板：科技风仪表盘——顶部最低电量大表盘，下面温度读数和设备卡片。"""
 
-    LW = 360
-    HEAD_H = 56
-    TEMP_H = 44
-    FOOT_H = 52
-    CARD_H = 68
-    GAP = 6
+    LW = 372
+    HEAD_H = 52
+    HERO_H = 160
+    TEMP_H = 48
+    TOP_H = HEAD_H + HERO_H + TEMP_H
+    FOOT_H = 48
+    CARD_H = 64
+    GAP = 8
     MAX_ROWS = 5
-    EMPTY_H = 156
-    RING = 44
+    EMPTY_H = 150
+    HERO_RING = 124
+    HERO_THICK = 9
+    BEZEL = 160
+    SEG_N = 10
 
     def __init__(self, app: "TrayApp"):
         self.app = app
@@ -4649,7 +4758,7 @@ class Panel(_Fluent):
         self.root.overrideredirect(True)
         self._fl_init(app.theme_light)
         self.W = self._px(self.LW)
-        self.LH = self.HEAD_H + self.TEMP_H + self.EMPTY_H + 12 + self.FOOT_H
+        self.LH = self.TOP_H + self.EMPTY_H + 12 + self.FOOT_H
         self.H = self._px(self.LH)
         self.root.configure(bg=_rgb(self.c["bg"]))
         self.cv = tk.Canvas(self.root, width=self.W, height=self.H,
@@ -4682,7 +4791,9 @@ class Panel(_Fluent):
         self._scroll = 0.0
         self._render_scroll = 0.0
         self._max_scroll = 0.0
-        self._list = (self.HEAD_H + self.TEMP_H,) * 2
+        self._list = (self.TOP_H,) * 2
+        self._hero = None
+        self._live = None
         self._temp_items = []
         self._thumb = None
         self._card_rects = {}
@@ -4725,13 +4836,13 @@ class Panel(_Fluent):
         return self._visible
 
     def _prewarm(self):
-        """后台线程提前生成卡片、圆环、开关的位图，动画第一次就流畅。"""
+        """后台线程提前生成背景、表盘、卡片、开关的位图，动画第一次就流畅。"""
         c = self.c
-        w = self.LW - 24
-        specs = [self._spec_card(k) for k in range(5)]
-        specs.append(self._spec_shadow(w, self.CARD_H, 6))
-        specs += [self._spec_ring(self.RING, 4.5, lv, level_rgb(lv, c))
-                  for lv in range(0, 101)]
+        specs = [self._spec_backdrop()]
+        specs += [self._spec_card(k) for k in range(5)]
+        specs += [self._spec_hero_ring(lv) for lv in range(0, 101)]
+        specs += [self._spec_bezel(col) for col in
+                  (c["ok"], c["warn"], c["bad"], c["dim"])]
         specs += [self._spec_toggle(f, hv) for f in range(7)
                   for hv in (False, True)]
         todo = [s for s in specs if s[0] not in _B64]
@@ -4745,10 +4856,43 @@ class Panel(_Fluent):
         threading.Thread(target=work, daemon=True).start()
 
     def _spec_card(self, k):
+        """玻璃卡片：上沿亮、下沿暗的描边，悬停时上沿泛青光。"""
         c = self.c
-        return self._spec_rr(self.LW - 24, self.CARD_H, 6,
-                             _mix(c["card"], c["card_hover"], k / 4.0),
-                             c["stroke_top"], c["stroke_bot"])
+        t = k / 4.0
+        return self._spec_rr(self.LW - 28, self.CARD_H, 10,
+                             _mix(c["card"], c["card_hover"], t),
+                             _mix(c["stroke_top"], c["accent"], 0.45 * t),
+                             _mix(c["stroke_bot"], c["stroke"], t))
+
+    def _spec_backdrop(self):
+        W, H, S, c = self._px(self.LW), self._px(self.TOP_H), self.S, self.c
+        return (("backdrop", W, H, c["accent"], c["grid"]),
+                lambda: backdrop_png(W, H, S, c))
+
+    def _spec_hero_ring(self, lv):
+        c = self.c
+        col = level_rgb(lv, c)
+        D, T = self._px(self.HERO_RING), round(self.HERO_THICK * self.S, 3)
+        tail = _mix(col, c["accent2"], 0.7)
+        return (("hring", D, T, lv, col, c["track"]),
+                lambda: ring_png(D, T, lv, col, c["track"], tail))
+
+    def _spec_bezel(self, col):
+        c, S = self.c, self.S
+        B, D = self._px(self.BEZEL), self._px(self.HERO_RING)
+        T = self.HERO_THICK * S
+        tick = _mix(c["dim"], c["bg"], 0.25)
+        major = _mix(c["dim"], c["text"], 0.35)
+        return (("bezel", B, D, col, tick, major),
+                lambda: bezel_png(B, D, T, S, col, tick, major))
+
+    def _seg_color(self, i, lv, col, stale):
+        """电量格：第 i 格（0 起）的颜色，亮格从紫青渐变到电量色。"""
+        c = self.c
+        if lv is None or lv <= i * 10:
+            return c["track"]
+        col = _mix(_mix(col, c["accent2"], 0.55), col, i / (self.SEG_N - 1))
+        return _mix(col, c["track"], 0.55) if stale else col
 
     # -- 显示 / 隐藏 ---------------------------------------------------------
     def _anchor(self, h=None):
@@ -4963,11 +5107,11 @@ class Panel(_Fluent):
             list_h = content = self.EMPTY_H
         self._max_scroll = max(0.0, float(content - list_h))
         self._scroll = max(0.0, min(self._scroll, self._max_scroll))
-        top = self.HEAD_H + self.TEMP_H
+        top = self.TOP_H
         self._list = (top, top + list_h)
         self._resize(top + list_h + 12 + self.FOOT_H)
 
-        for k in ("card", "hover", "scroll", "tog", "hv_", "bob"):
+        for k in ("card", "hover", "scroll", "tog", "hv_", "bob", "hero"):
             self._cancel(k)
         cv.delete("all")
         self._btns = {}
@@ -4975,81 +5119,63 @@ class Panel(_Fluent):
         self._card_bg = {}
         self._badges = []
         self._bob = None
+        self._live = None
         self._thumb = None
         self._card_texts = {}
         self._scroll_target = self._scroll
         W, LH = self.LW, self.LH
         foot_y = top + list_h + 12
-        cv.create_image(0, 0, anchor="nw", image=self._grad(W, 0, foot_y,
-                                                            foot_y))
+        cv.create_rectangle(0, 0, W, LH, fill=_rgb(c["bg"]), outline="")
         self._render_scroll = self._scroll
         if n:
             y0 = top - self._scroll
             step = self.CARD_H + self.GAP
-            for i, key in enumerate(keys):  # 先铺全部投影，避免压到上一张卡
-                y = y0 + i * step
-                cv.create_image(12 - 10, y - 10 + 2, anchor="nw",
-                                tags=("lst", f"card_{key}"),
-                                image=self._img(self._spec_shadow(
-                                    W - 24, self.CARD_H, 6)))
             for i, key in enumerate(keys):
                 y = y0 + i * step
-                self._card(i, 12, y, W - 12, y + self.CARD_H, key, snap[key],
+                self._card(i, 14, y, W - 14, y + self.CARD_H, key, snap[key],
                            entrance)
         else:
-            self._empty(12, top, W - 12, top + list_h)
+            self._empty(14, top, W - 14, top + list_h)
 
-        # 可滚动时，用同一段渐变遮住滚出视口的卡片
-        if self._max_scroll > 0:
-            cv.create_image(0, 0, anchor="nw",
-                            image=self._grad(W, 0, top, foot_y))
-            cv.create_image(0, top + list_h, anchor="nw",
-                            image=self._grad(W, top + list_h, 12, foot_y))
+        # 顶部背景（不透明）画在卡片之上，兼做滚动遮罩；底部留白同理
+        cv.create_image(0, 0, anchor="nw", image=self._img(
+            self._spec_backdrop()))
+        cv.create_rectangle(0, top + list_h, W, foot_y, fill=_rgb(c["bg"]),
+                            outline="")
 
-        # 标题栏
-        self._ctext(18, 29, "外设电量", c["text"], self._f(13, True),
+        # 标题栏：渐变小标志 + 标题 + 英文副标
+        cv.create_image(16, 13, anchor="nw", image=self._logo(26))
+        self._ctext(29, 26, GLYPH["bolt"], c["on_accent"], self._fi(12))
+        self._ctext(52, 21, "外设电量", c["text"], self._f(13, True),
                     anchor="w")
-        tw = tkfont.Font(root=self.root, font=self._f(13, True)).measure(
-            "外设电量") / self.S
-        hx = 18 + tw + 8
-        if n:
-            item = self._ctext(hx, 30, f"{n} 台设备", c["dim"], self._f(10),
-                               anchor="w")
-            try:
-                hx = cv.bbox(item)[2] + 8
-            except Exception:
-                hx += 60
-        low = sum(1 for r in snap.values()
-                  if r.ok and r.level is not None and r.level < 20
-                  and not r.stale)
-        if low:
-            text = f"{low} 台电量低"
-            cw = tkfont.Font(root=self.root, font=self._f(9, True)).measure(
-                text) / self.S + 16
-            cv.create_image(hx, 20, anchor="nw",
-                            image=self._rr(cw, 20, 10,
-                                           _mix(c["bg_top"], c["bad"], 0.18)))
-            self._ctext(hx + cw / 2, 30, text, c["bad"], self._f(9, True))
-        self._temp_row(self.HEAD_H - 2)
-        bx = W - 12 - 32
+        self._ctext(52, 38, "WIRELESS POWER MONITOR", c["dim"], self._fm(7.5),
+                    anchor="w")
+        bx = W - 14 - 32
         if self.app.panel_only:
-            self._button(bx, 13, 32, 32, GLYPH["close"], self.hide,
+            self._button(bx, 10, 32, 32, GLYPH["close"], self.hide,
                          kind="subtle", tag="btn_close", glyph=True, size=11)
             bx -= 36
-        self._button(bx, 13, 32, 32, GLYPH["refresh"], self._refresh,
+        self._button(bx, 10, 32, 32, GLYPH["refresh"], self._refresh,
                      kind="subtle", tag="btn_refresh", glyph=True, size=13)
 
-        # 底栏
+        self._hero_section(snap, self.HEAD_H, entrance)
+        self._temp_row(self.HEAD_H + self.HERO_H + 2)
+
+        # 底栏：状态灯 + 更新时间 + 开机自启
         cv.create_rectangle(0, foot_y, W, LH, fill=_rgb(c["footer"]),
                             outline="")
         cv.create_line(0, foot_y, W, foot_y, fill=_rgb(c["divider"]),
                        width=self._px(1))
-        self._ctext(18, foot_y + self.FOOT_H / 2, self._updated_text(),
-                    c["sub"], self._f(10), anchor="w")
-        tx = W - 18 - 40
-        self._toggle(tx, foot_y + (self.FOOT_H - 20) / 2, self._startup_var)
-        self._ctext(tx - 10, foot_y + self.FOOT_H / 2, "开机自启", c["text"],
-                    self._f(10), anchor="e", tags=("tog",))
+        fy = foot_y + self.FOOT_H / 2
+        live = n and not self.app._refreshing
+        self._live = cv.create_image(16, fy - 4, anchor="nw", image=self._disc(
+            8, c["ok"] if live else c["dim"])) if n else None
+        self._ctext(30 if n else 16, fy, self._updated_text(), c["sub"],
+                    self._f(9), anchor="w")
+        tx = W - 16 - 40
+        self._toggle(tx, fy - 10, self._startup_var)
+        self._ctext(tx - 10, fy, "开机自启", c["text"], self._f(10),
+                    anchor="e", tags=("tog",))
         if not IS_WIN11:
             cv.create_image(0, 0, anchor="nw", image=self._rr(
                 W, LH, 8, None, c["ctl_stroke"]))
@@ -5057,6 +5183,111 @@ class Panel(_Fluent):
         cv.scale("all", 0, 0, self.S, self.S)
         if entrance:
             self._entrance(keys)
+
+    def _logo(self, size):
+        D, c = self._px(size), self.c
+        return self._image(("logo", D, c["accent2"], c["accent"]),
+                           lambda: logo_png(D, 7 * self.S, c["accent2"],
+                                            c["accent"]))
+
+    # -- 顶部大表盘：所有设备里电量最低的那台 ---------------------------------
+    def _hero_section(self, snap, y0, entrance):
+        c = self.c
+        cv = self.cv
+        live = [r for r in snap.values()
+                if r.ok and r.level is not None and not r.stale]
+        known = [r for r in snap.values() if r.ok and r.level is not None]
+        pick = min(live or known, key=lambda r: r.level) if known else None
+        lv = pick.level if pick else None
+        col = level_rgb(lv, c)
+        cx, cy = 98, y0 + self.HERO_H / 2 - 2
+        B, D = self.BEZEL, self.HERO_RING
+        cv.create_image(cx - B / 2, cy - B / 2, anchor="nw",
+                        image=self._img(self._spec_bezel(col)))
+        start = 0 if (entrance or "_hero" not in self._shown_lv) else \
+            self._shown_lv["_hero"]
+        if lv is None:
+            start = None
+        ring = cv.create_image(cx - D / 2, cy - D / 2, anchor="nw",
+                               image=self._img(self._spec_hero_ring(start)))
+        ncol = c["text"] if pick and not pick.stale else c["sub"]
+        num = self._ctext(cx - 5, cy - 5, "--" if lv is None else str(start),
+                          ncol if lv is not None else c["dim"],
+                          self._fn(36))
+        pct = self._ctext(cx + 22, cy - 13, "%", c["sub"], self._fn(12),
+                          anchor="w")
+        self._ctext(cx, cy + 26, "LOWEST", c["dim"], self._fm(7.5))
+        self._hero = (ring, num, pct)
+        self._place_pct()
+        if lv is None:
+            self._shown_lv.pop("_hero", None)
+            cv.itemconfigure(pct, text="")
+        else:
+            self._shown_lv["_hero"] = start
+            if start != lv:
+                def step(e, s=start, t=lv):
+                    v = int(round(s + (t - s) * e))
+                    cv.itemconfigure(ring, image=self._img(
+                        self._spec_hero_ring(v)))
+                    cv.itemconfigure(num, text=str(v))
+                    self._place_pct()
+                    self._shown_lv["_hero"] = v
+                self._anim(0.5 + 0.7 * abs(lv - start) / 100.0, step,
+                           delay=0.1 if entrance else 0.0, key="hero_ring")
+
+        # 右侧读数：设备名、状态、在线数 / 平均电量
+        x = 192
+        w = self.LW - 16 - x
+        self._ctext(x, y0 + 24, "LOWEST DEVICE", c["dim"], self._fm(7.5),
+                    anchor="w")
+        name = pick.name if pick else ("等待设备接入" if not snap else "暂无读数")
+        self._ctext(x, y0 + 45, self._fit(name or "设备", self._f(13, True), w),
+                    c["text"], self._f(13, True), anchor="w")
+        low = sum(1 for r in live if r.level < 20)
+        if not snap:
+            status, scol = "插入 2.4G 接收器后自动识别", c["sub"]
+        elif low:
+            status, scol = f"{low} 台设备电量低，记得充电", c["bad"]
+        elif pick is None:
+            status, scol = "设备休眠或协议未知", c["sub"]
+        elif pick.stale:
+            status, scol = pick.detail or "上次读数", c["sub"]
+        elif pick.status == "charging":
+            status, scol = "正在充电", c["accent"]
+        else:
+            status, scol = "电量充足" if lv >= 60 else (
+                "电量一般" if lv >= 30 else "电量偏低"), col
+        self._ctext(x, y0 + 66, self._fit(status, self._f(9), w), scol,
+                    self._f(9), anchor="w")
+        online = sum(1 for r in snap.values() if r.present or
+                     r.kind == "bluetooth")
+        avg = (round(sum(r.level for r in known) / len(known))
+               if known else None)
+        tw = (w - 8) / 2
+        for i, (label, value) in enumerate((
+                ("ONLINE", f"{online}/{len(snap)}" if snap else "0"),
+                ("AVERAGE", "--" if avg is None else f"{avg}%"))):
+            tx = x + i * (tw + 8)
+            ty = y0 + 86
+            cv.create_image(tx, ty, anchor="nw", image=self._rr(
+                tw, 46, 8, _mix(c["card"], c["bg"], 0.3), c["stroke_top"],
+                c["stroke_bot"]))
+            self._ctext(tx + 10, ty + 15, label, c["dim"], self._fm(7),
+                        anchor="w")
+            self._ctext(tx + 10, ty + 32, value, c["text"], self._fn(15),
+                        anchor="w")
+
+    def _place_pct(self):
+        """大数字宽度随计数变化，% 号跟在数字右上角。"""
+        if not self._hero:
+            return
+        _ring, num, pct = self._hero
+        try:
+            x2 = self.cv.bbox(num)[2]
+            _x, y = self.cv.coords(pct)
+            self.cv.coords(pct, x2 + 2 * self.S, y)
+        except Exception:
+            pass
 
     # -- CPU / GPU 温度 -------------------------------------------------------
     def _temp_chips(self):
@@ -5076,45 +5307,57 @@ class Panel(_Fluent):
             return "—" if loaded else "读取中"
         return ("≈" if v.get("approx") else "") + f"{v['value']:.0f}°C"
 
+    def _temp_bar(self, w, value):
+        """读数格底部的温度条：按 0–100°C 填充。"""
+        if value is None:
+            return self._blank(1, 1), 1
+        bw = max(3, int(round(w * max(0.0, min(1.0, value / 100.0)))))
+        return self._rr(bw, 3, 1.5, temp_rgb(value, self.c)), bw
+
     def _temp_row(self, y):
-        """标题下方一排温度小卡：圆点颜色随温度（<70 绿、<85 黄、更高红）。"""
+        """一排温度读数格：英文标签 + 仪表数字 + 底部温度条（<70 绿、<85 黄、更高红）。"""
         c = self.c
         cv = self.cv
         chips, loaded = self._temp_chips()
         n = len(chips)
         gap = 8
-        cw = (self.LW - 24 - gap * (n - 1)) / n
+        cw = (self.LW - 28 - gap * (n - 1)) / n
         self._temp_items = []
         for i, (label, v) in enumerate(chips):
-            x = 12 + i * (cw + gap)
+            x = 14 + i * (cw + gap)
             value = v["value"] if v else None
             cv.create_image(x, y, anchor="nw", image=self._rr(
-                cw, 34, 6, c["card"], c["stroke_top"], c["stroke_bot"]))
-            dot = cv.create_image(x + 12, y + 13, anchor="nw",
-                                  image=self._disc(8, temp_rgb(value, c)))
-            self._ctext(x + 26, y + 17, label, c["sub"], self._f(9, True),
+                cw, 38, 8, c["card"], c["stroke_top"], c["stroke_bot"]))
+            dot = cv.create_image(x + 10, y + 13, anchor="nw",
+                                  image=self._disc(6, temp_rgb(value, c)))
+            self._ctext(x + 21, y + 16, label, c["sub"], self._fm(8, True),
                         anchor="w")
-            val = self._ctext(x + cw - 12, y + 17, self._temp_text(v, loaded),
-                              c["text"] if v else c["dim"], self._fn(11),
+            val = self._ctext(x + cw - 10, y + 16, self._temp_text(v, loaded),
+                              c["text"] if v else c["dim"], self._fn(13),
                               anchor="e")
-            self._temp_items.append((label, dot, val))
+            cv.create_image(x + 10, y + 29, anchor="nw",
+                            image=self._rr(cw - 20, 3, 1.5, c["track"]))
+            img, _bw = self._temp_bar(cw - 20, value)
+            bar = cv.create_image(x + 10, y + 29, anchor="nw", image=img)
+            self._temp_items.append((label, dot, val, bar, cw - 20))
 
     def update_temps(self):
-        """温度刷新只改数字和圆点，不整面板重绘（不打断动效、悬停）。"""
+        """温度刷新只改数字、圆点和温度条，不整面板重绘（不打断动效、悬停）。"""
         if not self._visible or self._entry:
             return
         chips, loaded = self._temp_chips()
-        if [l for l, _v in chips] != [l for l, _d, _t in self._temp_items]:
+        if [l for l, _v in chips] != [it[0] for it in self._temp_items]:
             self.refresh_view()
             return
-        for (_l, v), (_l2, dot, val) in zip(chips, self._temp_items):
+        for (_l, v), (_l2, dot, val, bar, bw) in zip(chips, self._temp_items):
             value = v["value"] if v else None
             try:
                 self.cv.itemconfigure(dot, image=self._disc(
-                    8, temp_rgb(value, self.c)))
+                    6, temp_rgb(value, self.c)))
                 self.cv.itemconfigure(
                     val, text=self._temp_text(v, loaded),
                     fill=_rgb(self.c["text"] if v else self.c["dim"]))
+                self.cv.itemconfigure(bar, image=self._temp_bar(bw, value)[0])
             except tk.TclError:
                 pass
 
@@ -5199,90 +5442,104 @@ class Panel(_Fluent):
         texts = []
         cy = (y1 + y2) / 2
 
-        # 设备图标：底色带一点电量色
-        well = _mix(c["card"], col, 0.16) if lv is not None else c["well"]
-        cv.create_image(x1 + 14, cy - 19, anchor="nw", tags=tags,
-                        image=self._disc(38, well))
-        gcol = _mix(col, c["text"], 0.35) if lv is not None else c["text"]
+        # 设备图标：圆角方块，底色和描边带一点电量色
+        tint = col if lv is not None else c["dim"]
+        cv.create_image(x1 + 12, cy - 20, anchor="nw", tags=tags,
+                        image=self._rr(40, 40, 10, _mix(c["card"], tint, 0.14),
+                                       _mix(c["card"], tint, 0.55),
+                                       _mix(c["card"], tint, 0.25)))
+        gcol = _mix(tint, c["text"], 0.25)
         glyph = _device_glyph(r.name, "bluetooth" if r.kind == "bluetooth"
                               else "device")
-        texts.append((self._ctext(x1 + 33, cy, glyph, gcol,
-                                  self._fi(15), tags=tags), gcol))
+        texts.append((self._ctext(x1 + 32, cy, glyph, gcol,
+                                  self._fi(16), tags=tags), gcol))
         if r.ok and r.status == "charging" and not r.stale:
-            b = cv.create_image(x1 + 38, cy + 5, anchor="nw", tags=tags,
+            b = cv.create_image(x1 + 40, cy + 8, anchor="nw", tags=tags,
                                 image=self._disc(16, c["accent"]))
             self._badges.append(b)
-            self._ctext(x1 + 46, cy + 13, GLYPH["bolt"], c["on_accent"],
+            self._ctext(x1 + 48, cy + 16, GLYPH["bolt"], c["on_accent"],
                         self._fi(8), tags=tags)
 
+        need_fix = r.status == "unknown_proto"
         tx = x1 + 64
-        rx = x2 - 14 - self.RING
+        rx = x2 - (100 if need_fix else 96)
         name_font = self._f(11, True)
         nm = self._ctext(tx, cy - 10, self._fit(r.name or "设备", name_font,
-                                               rx - 12 - tx),
+                                               rx - tx),
                          c["text"], name_font, anchor="w",
                          tags=tags + (f"nm_{key}",))
         texts.append((nm, c["text"]))
         cv.tag_bind(f"nm_{key}", "<Double-Button-1>",
                     lambda e, k=key: self._edit_name_at(k))
-        sub, need_fix = self._subtitle(r)
+        sub, _fix = self._subtitle(r)
         low = lv is not None and lv < 20 and not r.stale
         sub_font = self._f(9)
-        sub = self._fit(sub, sub_font, rx - 12 - tx - (64 if need_fix else 0))
         scol = c["bad"] if low else c["sub"]
-        item = self._ctext(tx, cy + 12, sub, scol, sub_font, anchor="w",
-                           tags=tags)
+        item = self._ctext(tx, cy + 11, self._fit(sub, sub_font, rx - tx),
+                           scol, sub_font, anchor="w", tags=tags)
         texts.append((item, scol))
-        if need_fix:
-            try:
-                sx = cv.bbox(item)[2] + 8
-            except Exception:
-                sx = tx + 60
-            link = self._link(sx, cy + 12, "设置读取",
-                              lambda k=key: self.open_help(k),
-                              f"fix_{key}", size=9)
-            cv.addtag_withtag("lst", link)
-            cv.addtag_withtag(tag, link)
-            texts.append((link, c["link"]))
 
-        # 电量圆环：从上次显示值（新打开时从 0）扫到当前值，数字同步计数
-        ring_y = cy - self.RING / 2
+        if need_fix:
+            # 协议未知：右侧直接给一个醒目的「设置读取」按钮
+            btn = self._button(x2 - 12 - 84, cy - 15, 84, 30, "设置读取",
+                               lambda k=key: self.open_help(k), kind="accent",
+                               tag=f"btn_fix_{key}", size=9)
+            cv.addtag_withtag("lst", btn)
+            cv.addtag_withtag(tag, btn)
+            self._shown_lv.pop(key, None)
+            self._card_texts[key] = texts
+            self._bind_card(tag, key)
+            return
+
+        # 读数：大号数字 + 10 格电量条，从上次显示值（新打开时从 0）计数到当前值
+        nx = x2 - 26
         target = lv
         start = 0 if (entrance or key not in self._shown_lv) else \
             self._shown_lv[key]
         if target is None:
-            ring = cv.create_image(rx, ring_y, anchor="nw", tags=tags,
-                                   image=self._ring(self.RING, 4.5, None,
-                                                    col))
-            num = self._ctext(rx + self.RING / 2, cy, "–", c["dim"],
-                              self._fn(12), tags=tags)
-            texts.append((num, c["dim"]))
-            self._shown_lv.pop(key, None)
+            start = None
         else:
             start = target if start is None else start
-            ncol = c["sub"] if r.stale else c["text"]
-            ring = cv.create_image(rx, ring_y, anchor="nw", tags=tags,
-                                   image=self._ring(self.RING, 4.5, start,
-                                                    col))
-            num = self._ctext(rx + self.RING / 2, cy, str(start), ncol,
-                              self._fn(11 if target >= 100 else 12),
-                              tags=tags)
-            texts.append((num, ncol))
+        ncol = c["dim"] if target is None else (
+            c["sub"] if r.stale else c["text"])
+        num = self._ctext(nx, cy - 7, "--" if target is None else str(start),
+                          ncol, self._fn(20), anchor="e", tags=tags)
+        texts.append((num, ncol))
+        pct = self._ctext(nx + 2, cy - 11, "%" if target is not None else "",
+                          c["dim"], self._fn(9), anchor="w", tags=tags)
+        texts.append((pct, c["dim"]))
+        segs = []
+        sw, sg = 5, 2
+        sx = x2 - 14 - (self.SEG_N * sw + (self.SEG_N - 1) * sg)
+        for j in range(self.SEG_N):
+            segs.append(cv.create_image(
+                sx + j * (sw + sg), cy + 11, anchor="nw", tags=tags,
+                image=self._rr(sw, 6, 1.5, self._seg_color(
+                    j, start, col, r.stale))))
+        if target is None:
+            self._shown_lv.pop(key, None)
+        else:
             self._shown_lv[key] = start
             if start != target:
-                def step(e, s=start, t=target, ring=ring, num=num, col=col,
-                         key=key):
+                def step(e, s=start, t=target, num=num, segs=segs, col=col,
+                         key=key, stale=r.stale):
                     v = int(round(s + (t - s) * e))
-                    cv.itemconfigure(ring, image=self._ring(self.RING, 4.5,
-                                                            v, col))
                     cv.itemconfigure(num, text=str(v))
+                    for j, sg_item in enumerate(segs):
+                        cv.itemconfigure(sg_item, image=self._rr(
+                            5, 6, 1.5, self._seg_color(j, v, col, stale)))
                     self._shown_lv[key] = v
                 dur = 0.35 + 0.6 * abs(target - start) / 100.0
                 self._anim(dur, step, delay=(0.12 + i * 0.05) if entrance
                            else 0.0, key=f"card_ring_{key}")
         self._card_texts[key] = texts
-        cv.tag_bind(tag, "<Enter>", lambda e, k=key: self._hover_card(k, True))
-        cv.tag_bind(tag, "<Leave>", lambda e, k=key: self._hover_card(k, False))
+        self._bind_card(tag, key)
+
+    def _bind_card(self, tag, key):
+        self.cv.tag_bind(tag, "<Enter>",
+                         lambda e, k=key: self._hover_card(k, True))
+        self.cv.tag_bind(tag, "<Leave>",
+                         lambda e, k=key: self._hover_card(k, False))
 
     def _hover_card(self, key, on):
         """悬停底色 5 帧过渡（约 120ms）。"""
@@ -5306,24 +5563,23 @@ class Panel(_Fluent):
     def _empty(self, x1, y1, x2, y2):
         c = self.c
         cv = self.cv
-        cv.create_image(x1 - 10, y1 - 8, anchor="nw",
-                        image=self._img(self._spec_shadow(x2 - x1, y2 - y1,
-                                                          6)))
         cv.create_image(x1, y1, anchor="nw",
-                        image=self._rr(x2 - x1, y2 - y1, 6, c["card"],
+                        image=self._rr(x2 - x1, y2 - y1, 10, c["card"],
                                        c["stroke_top"], c["stroke_bot"]))
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
-        cv.create_image(cx - 28, cy - 58, anchor="nw",
-                        image=self._disc(56, _mix(c["card"], c["accent"],
-                                                  0.14)))
-        icon = self._ctext(cx, cy - 30, GLYPH["device"], c["link"],
-                           self._fi(24))
-        self._bob = (icon, cy - 30)
-        self._ctext(cx, cy + 16, "没有设备", c["text"], self._f(12, True))
-        self._ctext(cx, cy + 40, "插入或重新拔插 2.4G 接收器即可添加",
-                    c["sub"], self._f(10))
-        self._link(cx, cy + 62, "有别人分享的协议文件？点这里导入",
+        cv.create_image(cx - 24, cy - 56, anchor="nw",
+                        image=self._rr(48, 48, 12,
+                                       _mix(c["card"], c["accent"], 0.12),
+                                       _mix(c["card"], c["accent"], 0.6),
+                                       _mix(c["card"], c["accent"], 0.2)))
+        icon = self._ctext(cx, cy - 32, GLYPH["device"], c["link"],
+                           self._fi(20))
+        self._bob = (icon, cy - 32)
+        self._ctext(cx, cy + 10, "还没有设备", c["text"], self._f(12, True))
+        self._ctext(cx, cy + 32, "插入或重新拔插 2.4G 接收器即可添加",
+                    c["sub"], self._f(9))
+        self._link(cx, cy + 54, "有别人分享的协议文件？点这里导入",
                    self.import_protocol, "btn_empty_import", size=9,
                    anchor="center")
 
@@ -5401,6 +5657,15 @@ class Panel(_Fluent):
                     cv.itemconfigure(b, image=img)
                 except tk.TclError:
                     pass
+        if self._live:
+            # 底栏状态灯：在线时缓慢呼吸，刷新中变灰
+            k = (math.sin(now * 2.4) + 1) / 2
+            col = (self.c["dim"] if self.app._refreshing else
+                   _mix(self.c["ok"], self.c["footer"], 0.55 * round(k * 4) / 4))
+            try:
+                cv.itemconfigure(self._live, image=self._disc(8, col))
+            except tk.TclError:
+                pass
         self.root.after(33, self._ambient)
 
     # -- 交互 ----------------------------------------------------------------
@@ -5614,7 +5879,7 @@ class Panel(_Fluent):
         current = (r.name if r and r.name else "")
         S = self.S
         c = self.c
-        limit_px = int((self.LW - 64 - 12 - 14 - self.RING - 24) * S)
+        limit_px = int((self.LW - 28 - 64 - 96) * S)  # 与卡片名称可用宽度一致
         font = tkfont.Font(root=self.root, family=FONT,
                            size=-int(round(11 * S)), weight="bold")
         cjk = max(1, font.measure("汉"))
