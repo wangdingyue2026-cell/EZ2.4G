@@ -18,8 +18,8 @@ Windows 10/11 的无线外设电量托盘工具：2.4G 接收器 + 蓝牙设备�
 
 两种方式任选：
 
-- **免安装（推荐）**：打开本仓库的 [Actions](../../actions/workflows/build.yml)，进入最新一次成功的构建，在 Artifacts 里下载 `2.4G-exe`（需登录 GitHub），解压后双击 `2.4G.exe`，无需 Python。
-  原作者发布的原版在 [这里](https://github.com/Ap0LoG1zE/EZ2.4G/releases)。
+- **免安装（推荐）**：到 [Releases](../../releases/latest) 下载 `2.4G.exe`，双击运行，无需 Python。
+  每次提交自动构建的测试版在 [Actions](../../actions/workflows/build.yml) 的 Artifacts 里（需登录 GitHub）；原作者发布的原版在[这里](https://github.com/Ap0LoG1zE/EZ2.4G/releases)。
 - **最小体积**：下载 `my_devices.py`（约 185 KB），安装 Python 3.10+ 后运行：
 
 ```bat
