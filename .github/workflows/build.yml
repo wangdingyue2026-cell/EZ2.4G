@@ -25,6 +25,11 @@ jobs:
       - name: Bluetooth tests (offline + real Windows API call)
         run: python ci/test_bluetooth.py my_devices.py
 
+      - name: Tray and temperature tests (offline + real Windows API calls)
+        run: |
+          python ci/test_tray.py my_devices.py
+          python ci/test_temps.py my_devices.py
+
       - name: UI smoke test (render every window and screenshot it)
         run: python ci/ui_smoke.py my_devices.py screenshots
 

@@ -48,8 +48,17 @@ SNAP = {
 }
 
 
+TEMPS = {
+    False: {"cpu": {"value": 58.0, "approx": False},
+            "gpus": [{"name": "NVIDIA", "value": 76.0},
+                     {"name": "Intel", "value": 49.0}], "ts": 0},
+    True: {"cpu": {"value": 41.0, "approx": True}, "gpus": [], "ts": 0},
+}
+
+
 def make_app(light, snap):
     return types.SimpleNamespace(
+        _temps=TEMPS[light],
         theme_light=light, panel_only=False, snapshot=lambda: dict(snap),
         _refreshing=False, _lock=threading.Lock(), _readings=snap,
         refresh=lambda: None, remove_device=lambda k: None,

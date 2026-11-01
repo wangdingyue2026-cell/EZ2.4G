@@ -716,6 +716,293 @@ def read_bluetooth_all() -> dict[str, Reading]:
 
 
 # ===========================================================================
+# CPU / GPU 温度
+#   GPU：D3DKMT 适配器性能数据（任务管理器同源，WDDM 2.7+ 驱动，无需管理员）
+#   CPU：LibreHardwareMonitor / OpenHardwareMonitor 在运行时读它们的传感器（准确）；
+#        否则退回系统“热区”计数器（ACPI，近似值，台式机常读不到）
+# ===========================================================================
+class LUID(ctypes.Structure):
+    _fields_ = [("LowPart", wt.DWORD), ("HighPart", wt.LONG)]
+
+
+class D3DKMT_ADAPTERINFO(ctypes.Structure):
+    _fields_ = [("hAdapter", wt.UINT), ("AdapterLuid", LUID),
+                ("NumOfSources", wt.ULONG),
+                ("bPrecisePresentRegionsPreferred", wt.BOOL)]
+
+
+class D3DKMT_ENUMADAPTERS2(ctypes.Structure):
+    _fields_ = [("NumAdapters", wt.ULONG),
+                ("pAdapters", ctypes.POINTER(D3DKMT_ADAPTERINFO))]
+
+
+class D3DKMT_QUERYADAPTERINFO(ctypes.Structure):
+    _fields_ = [("hAdapter", wt.UINT), ("Type", ctypes.c_int),
+                ("pPrivateDriverData", ctypes.c_void_p),
+                ("PrivateDriverDataSize", wt.UINT)]
+
+
+class D3DKMT_ADAPTER_PERFDATA(ctypes.Structure):
+    _fields_ = [("PhysicalAdapterIndex", ctypes.c_uint32),
+                ("MemoryFrequency", ctypes.c_ulonglong),
+                ("MaxMemoryFrequency", ctypes.c_ulonglong),
+                ("MaxMemoryFrequencyOC", ctypes.c_ulonglong),
+                ("MemoryBandwidth", ctypes.c_ulonglong),
+                ("PCIEBandwidth", ctypes.c_ulonglong),
+                ("FanRPM", wt.ULONG), ("Power", wt.ULONG),
+                ("Temperature", wt.ULONG),        # 0.1 °C
+                ("PowerStateOverride", ctypes.c_ubyte)]
+
+
+class D3DKMT_ADAPTERREGISTRYINFO(ctypes.Structure):
+    _fields_ = [("AdapterString", wt.WCHAR * 260),
+                ("BiosString", wt.WCHAR * 260),
+                ("DacType", wt.WCHAR * 260),
+                ("ChipType", wt.WCHAR * 260)]
+
+
+class D3DKMT_CLOSEADAPTER(ctypes.Structure):
+    _fields_ = [("hAdapter", wt.UINT)]
+
+
+class PDH_FMT_COUNTERVALUE(ctypes.Structure):
+    class _U(ctypes.Union):
+        _fields_ = [("longValue", wt.LONG), ("doubleValue", ctypes.c_double),
+                    ("largeValue", ctypes.c_longlong),
+                    ("WideStringValue", ctypes.c_wchar_p)]
+    _fields_ = [("CStatus", wt.DWORD), ("u", _U)]
+
+
+class PDH_FMT_COUNTERVALUE_ITEM_W(ctypes.Structure):
+    _fields_ = [("szName", ctypes.c_wchar_p),
+                ("FmtValue", PDH_FMT_COUNTERVALUE)]
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", wt.DWORD), ("cntUsage", wt.DWORD),
+                ("th32ProcessID", wt.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wt.DWORD), ("cntThreads", wt.DWORD),
+                ("th32ParentProcessID", wt.DWORD),
+                ("pcPriClassBase", wt.LONG), ("dwFlags", wt.DWORD),
+                ("szExeFile", wt.WCHAR * 260)]
+
+
+KMTQAITYPE_ADAPTERREGISTRYINFO = 8
+KMTQAITYPE_ADAPTERPERFDATA = 62
+PDH_FMT_DOUBLE = 0x00000200
+PDH_MORE_DATA = 0x800007D2
+HW_MONITORS = ("librehardwaremonitor.exe", "openhardwaremonitor.exe")
+
+
+def temp_rgb(value: Optional[float], c: dict) -> tuple:
+    if value is None:
+        return c["dim"]
+    if value < 70:
+        return c["ok"]
+    if value < 85:
+        return c["warn"]
+    return c["bad"]
+
+
+def gpu_temperatures() -> list:
+    """[{name, value(°C)}]；驱动不提供温度的适配器（核显、基本显示）跳过。"""
+    try:
+        enum2 = gdi32.D3DKMTEnumAdapters2
+        query = gdi32.D3DKMTQueryAdapterInfo
+        close = gdi32.D3DKMTCloseAdapter
+    except AttributeError:
+        return []
+    enum2.restype = query.restype = close.restype = ctypes.c_long
+    enum2.argtypes = [ctypes.POINTER(D3DKMT_ENUMADAPTERS2)]
+    query.argtypes = [ctypes.POINTER(D3DKMT_QUERYADAPTERINFO)]
+    close.argtypes = [ctypes.POINTER(D3DKMT_CLOSEADAPTER)]
+    ea = D3DKMT_ENUMADAPTERS2()
+    if enum2(ctypes.byref(ea)) != 0 or not ea.NumAdapters:
+        return []
+    arr = (D3DKMT_ADAPTERINFO * ea.NumAdapters)()
+    ea.pAdapters = ctypes.cast(arr, ctypes.POINTER(D3DKMT_ADAPTERINFO))
+    if enum2(ctypes.byref(ea)) != 0:
+        return []
+    out = []
+    for a in arr[:ea.NumAdapters]:
+        try:
+            perf = D3DKMT_ADAPTER_PERFDATA()
+            q = D3DKMT_QUERYADAPTERINFO(
+                a.hAdapter, KMTQAITYPE_ADAPTERPERFDATA,
+                ctypes.cast(ctypes.byref(perf), ctypes.c_void_p),
+                ctypes.sizeof(perf))
+            if query(ctypes.byref(q)) != 0 or not 0 < perf.Temperature < 1500:
+                continue
+            reg = D3DKMT_ADAPTERREGISTRYINFO()
+            q = D3DKMT_QUERYADAPTERINFO(
+                a.hAdapter, KMTQAITYPE_ADAPTERREGISTRYINFO,
+                ctypes.cast(ctypes.byref(reg), ctypes.c_void_p),
+                ctypes.sizeof(reg))
+            name = reg.AdapterString if query(ctypes.byref(q)) == 0 else ""
+            out.append({"name": name or "GPU",
+                        "value": perf.Temperature / 10.0})
+        finally:
+            close(ctypes.byref(D3DKMT_CLOSEADAPTER(a.hAdapter)))
+    return out
+
+
+def _cpu_thermal_zone() -> Optional[float]:
+    """系统热区温度（开尔文转摄氏），取各热区最高值；读不到返回 None。"""
+    try:
+        pdh = ctypes.WinDLL("pdh")
+    except Exception:
+        return None
+    for fn in (pdh.PdhOpenQueryW, pdh.PdhAddEnglishCounterW,
+               pdh.PdhCollectQueryData, pdh.PdhGetFormattedCounterArrayW,
+               pdh.PdhCloseQuery):
+        fn.restype = ctypes.c_ulong
+    q = ctypes.c_void_p()
+    if pdh.PdhOpenQueryW(None, None, ctypes.byref(q)) != 0:
+        return None
+    try:
+        counter = ctypes.c_void_p()
+        if pdh.PdhAddEnglishCounterW(
+                q, ctypes.c_wchar_p(
+                    "\\Thermal Zone Information(*)\\Temperature"),
+                None, ctypes.byref(counter)) != 0:
+            return None
+        if pdh.PdhCollectQueryData(q) != 0:
+            return None
+        size, count = wt.DWORD(0), wt.DWORD(0)
+        rc = pdh.PdhGetFormattedCounterArrayW(
+            counter, PDH_FMT_DOUBLE, ctypes.byref(size), ctypes.byref(count),
+            None)
+        if rc != PDH_MORE_DATA or not size.value:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if pdh.PdhGetFormattedCounterArrayW(
+                counter, PDH_FMT_DOUBLE, ctypes.byref(size),
+                ctypes.byref(count), buf) != 0:
+            return None
+        items = ctypes.cast(buf, ctypes.POINTER(PDH_FMT_COUNTERVALUE_ITEM_W))
+        vals = [items[i].FmtValue.u.doubleValue - 273.15
+                for i in range(count.value)
+                if items[i].FmtValue.CStatus in (0, 1)]
+        vals = [v for v in vals if 5 < v < 125]
+        return max(vals) if vals else None
+    finally:
+        pdh.PdhCloseQuery(q)
+
+
+def _hw_monitor_running() -> bool:
+    """LibreHardwareMonitor / OpenHardwareMonitor 是否在运行（不起 PowerShell 白跑）。"""
+    kernel32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+    kernel32.Process32FirstW.argtypes = [wt.HANDLE,
+                                         ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.argtypes = [wt.HANDLE,
+                                        ctypes.POINTER(PROCESSENTRY32W)]
+    snap = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if not snap or snap == INVALID_HANDLE_VALUE:
+        return False
+    try:
+        pe = PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(pe)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(pe))
+        while ok:
+            if pe.szExeFile.lower() in HW_MONITORS:
+                return True
+            ok = kernel32.Process32NextW(snap, ctypes.byref(pe))
+    finally:
+        kernel32.CloseHandle(snap)
+    return False
+
+
+_LHM_CACHE = {"at": 0.0, "data": []}
+_LHM_PS = (
+    "$r=@(); foreach($n in 'root/LibreHardwareMonitor','root/OpenHardwareMonitor')"
+    "{ try { $r += Get-CimInstance -Namespace $n -ClassName Sensor "
+    "-Filter \"SensorType='Temperature'\" -ErrorAction Stop | "
+    "Select-Object Name,Parent,Value } catch {} }; "
+    "ConvertTo-Json -InputObject @($r) -Compress")
+
+
+def _lhm_sensors() -> list:
+    """LibreHardwareMonitor 发布到 WMI 的温度传感器（10 秒缓存）。"""
+    now = time.time()
+    if now - _LHM_CACHE["at"] < 10:
+        return _LHM_CACHE["data"]
+    data = []
+    try:
+        if _hw_monitor_running():
+            ps = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                              "System32", "WindowsPowerShell", "v1.0",
+                              "powershell.exe")
+            out = subprocess.run(
+                [ps, "-NoProfile", "-NonInteractive", "-Command", _LHM_PS],
+                capture_output=True, timeout=8,
+                creationflags=CREATE_NO_WINDOW).stdout
+            text = out.decode("utf-8", "ignore").strip()
+            data = json.loads(text) if text else []
+            if isinstance(data, dict):
+                data = [data]
+    except Exception:
+        data = []
+    _LHM_CACHE.update(at=now, data=data)
+    return data
+
+
+def _pick_lhm(sensors: list) -> tuple:
+    """从传感器列表挑出 (CPU 温度, [GPU 温度…])。"""
+    cpu_pref = ("cpu package", "core (tctl/tdie)", "tctl/tdie", "core (tctl)",
+                "core average", "core max", "cpu core")
+    cpus, gpus = {}, {}
+    for s in sensors:
+        try:
+            name = str(s.get("Name") or "")
+            parent = str(s.get("Parent") or "").lower()
+            value = float(s.get("Value"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if not 5 < value < 125:
+            continue
+        if "cpu" in parent:
+            cpus[name.lower()] = value
+        elif parent.startswith("/gpu"):
+            gpus.setdefault(parent, {})[name.lower()] = value
+    cpu = next((cpus[k] for k in cpu_pref if k in cpus),
+               max(cpus.values()) if cpus else None)
+    gpu_list = []
+    for parent, vals in gpus.items():
+        v = vals.get("gpu core", max(vals.values()))
+        gpu_list.append({"name": parent, "value": v})
+    return cpu, gpu_list
+
+
+def read_temperatures() -> dict:
+    """{cpu: {value, approx} | None, gpus: [{name, value}], ts}。"""
+    cpu, gpus, lhm_gpus = None, [], []
+    try:
+        lhm = _lhm_sensors()
+        if lhm:
+            v, lhm_gpus = _pick_lhm(lhm)
+            if v is not None:
+                cpu = {"value": v, "approx": False}
+    except Exception:
+        pass
+    try:
+        gpus = gpu_temperatures()
+    except Exception:
+        gpus = []
+    if not gpus:
+        gpus = lhm_gpus
+    if cpu is None:
+        try:
+            v = _cpu_thermal_zone()
+        except Exception:
+            v = None
+        if v is not None:
+            cpu = {"value": v, "approx": True}
+    return {"cpu": cpu, "gpus": gpus, "ts": time.time()}
+
+
+# ===========================================================================
 # 设备服务
 # ===========================================================================
 def device_key(vid: int, pid: int) -> str:
@@ -4034,6 +4321,7 @@ class Panel(_Fluent):
 
     LW = 360
     HEAD_H = 56
+    TEMP_H = 44
     FOOT_H = 52
     CARD_H = 68
     GAP = 6
@@ -4048,7 +4336,7 @@ class Panel(_Fluent):
         self.root.overrideredirect(True)
         self._fl_init(app.theme_light)
         self.W = self._px(self.LW)
-        self.LH = self.HEAD_H + self.EMPTY_H + 12 + self.FOOT_H
+        self.LH = self.HEAD_H + self.TEMP_H + self.EMPTY_H + 12 + self.FOOT_H
         self.H = self._px(self.LH)
         self.root.configure(bg=_rgb(self.c["bg"]))
         self.cv = tk.Canvas(self.root, width=self.W, height=self.H,
@@ -4081,7 +4369,8 @@ class Panel(_Fluent):
         self._scroll = 0.0
         self._render_scroll = 0.0
         self._max_scroll = 0.0
-        self._list = (self.HEAD_H, self.HEAD_H)
+        self._list = (self.HEAD_H + self.TEMP_H,) * 2
+        self._temp_items = []
         self._thumb = None
         self._card_rects = {}
         self._card_bg = {}
@@ -4361,7 +4650,7 @@ class Panel(_Fluent):
             list_h = content = self.EMPTY_H
         self._max_scroll = max(0.0, float(content - list_h))
         self._scroll = max(0.0, min(self._scroll, self._max_scroll))
-        top = self.HEAD_H
+        top = self.HEAD_H + self.TEMP_H
         self._list = (top, top + list_h)
         self._resize(top + list_h + 12 + self.FOOT_H)
 
@@ -4428,6 +4717,7 @@ class Panel(_Fluent):
                             image=self._rr(cw, 20, 10,
                                            _mix(c["bg_top"], c["bad"], 0.18)))
             self._ctext(hx + cw / 2, 30, text, c["bad"], self._f(9, True))
+        self._temp_row(self.HEAD_H - 2)
         bx = W - 12 - 32
         if self.app.panel_only:
             self._button(bx, 13, 32, 32, GLYPH["close"], self.hide,
@@ -4454,6 +4744,66 @@ class Panel(_Fluent):
         cv.scale("all", 0, 0, self.S, self.S)
         if entrance:
             self._entrance(keys)
+
+    # -- CPU / GPU 温度 -------------------------------------------------------
+    def _temp_chips(self):
+        t = getattr(self.app, "_temps", None) or {}
+        chips = [("CPU", t.get("cpu"))]
+        gpus = (t.get("gpus") or [])[:2]
+        if gpus:
+            for i, g in enumerate(gpus):
+                chips.append(("GPU" if len(gpus) == 1 else f"GPU{i + 1}", g))
+        else:
+            chips.append(("GPU", None))
+        return chips, bool(t)
+
+    @staticmethod
+    def _temp_text(v, loaded: bool) -> str:
+        if not v:
+            return "—" if loaded else "读取中"
+        return ("≈" if v.get("approx") else "") + f"{v['value']:.0f}°C"
+
+    def _temp_row(self, y):
+        """标题下方一排温度小卡：圆点颜色随温度（<70 绿、<85 黄、更高红）。"""
+        c = self.c
+        cv = self.cv
+        chips, loaded = self._temp_chips()
+        n = len(chips)
+        gap = 8
+        cw = (self.LW - 24 - gap * (n - 1)) / n
+        self._temp_items = []
+        for i, (label, v) in enumerate(chips):
+            x = 12 + i * (cw + gap)
+            value = v["value"] if v else None
+            cv.create_image(x, y, anchor="nw", image=self._rr(
+                cw, 34, 6, c["card"], c["stroke_top"], c["stroke_bot"]))
+            dot = cv.create_image(x + 12, y + 13, anchor="nw",
+                                  image=self._disc(8, temp_rgb(value, c)))
+            self._ctext(x + 26, y + 17, label, c["sub"], self._f(9, True),
+                        anchor="w")
+            val = self._ctext(x + cw - 12, y + 17, self._temp_text(v, loaded),
+                              c["text"] if v else c["dim"], self._fn(11),
+                              anchor="e")
+            self._temp_items.append((label, dot, val))
+
+    def update_temps(self):
+        """温度刷新只改数字和圆点，不整面板重绘（不打断动效、悬停）。"""
+        if not self._visible or self._entry:
+            return
+        chips, loaded = self._temp_chips()
+        if [l for l, _v in chips] != [l for l, _d, _t in self._temp_items]:
+            self.refresh_view()
+            return
+        for (_l, v), (_l2, dot, val) in zip(chips, self._temp_items):
+            value = v["value"] if v else None
+            try:
+                self.cv.itemconfigure(dot, image=self._disc(
+                    8, temp_rgb(value, self.c)))
+                self.cv.itemconfigure(
+                    val, text=self._temp_text(v, loaded),
+                    fill=_rgb(self.c["text"] if v else self.c["dim"]))
+            except tk.TclError:
+                pass
 
     def _entrance(self, keys):
         """卡片依次上浮淡入（文字颜色从卡片底色过渡）。"""
@@ -5079,6 +5429,26 @@ def allow_dark_menus() -> None:
         pass
 
 
+def tray_summary(snap: dict) -> tuple:
+    """托盘图标的内容：(最低电量, 最低那台是否在充电, 悬停提示)。
+    提示第一行是最低电量的设备，下面按电量从低到高列出其余设备（系统限 127 字）。"""
+    rs = sorted((r for r in snap.values()
+                 if r and r.present and r.ok and r.level is not None),
+                key=lambda r: r.level)
+    if not rs:
+        return None, False, ("2.4G · 没有设备" if not snap
+                             else "2.4G · 暂无电量读数")
+    low = rs[0]
+    lines = [f"2.4G · 最低 {low.level}%：{low.name or '设备'}"]
+    lines += [f"{r.name or '设备'}  {r.level}%" for r in rs[1:]]
+    tip = lines[0]
+    for line in lines[1:]:
+        if len(tip) + 1 + len(line) > 127:
+            break
+        tip += "\n" + line
+    return low.level, low.status == "charging", tip[:127]
+
+
 class Tray:
     CLASS_NAME = "BatteryTrayWndDSH"
 
@@ -5137,35 +5507,19 @@ class Tray:
         self.sync_icons()
 
     def sync_icons(self):
-        """按实际插入的接收器增减托盘图标；一个都没有时清空托盘。"""
-        snap = self.app.snapshot()
-        present = [k for k, r in snap.items()
-                   if r and r.present and r.ok and r.level is not None]
-        desired = {i + 1: k for i, k in enumerate(present[:4])}
-        for uid in list(self.nids):
-            if uid not in desired:
-                shell32.Shell_NotifyIconW(NIM_DELETE,
-                                          ctypes.byref(self.nids[uid]))
-                del self.nids[uid]
-                old = self.icons.pop(uid, 0)
-                self.icon_keys.pop(uid, None)
-                if old:
-                    user32.DestroyIcon(old)
-        for uid, key in desired.items():
-            if uid in self.nids:
-                nid = self.nids[uid]
-                self._fill_icon(nid, key)
-                shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
-            else:
-                nid = self._make_nid(uid)
-                self._fill_icon(nid, key)
-                shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
-                self.nids[uid] = nid
+        """托盘始终只有一个图标：显示所有设备里最低的电量。"""
+        nid = self.nids.get(1)
+        if nid is None:
+            nid = self._make_nid(1)
+            self._fill_icon(nid)
+            shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
+            self.nids[1] = nid
+        else:
+            self._fill_icon(nid)
+            shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
 
-    def _fill_icon(self, nid: NOTIFYICONDATAW, key: str):
-        r = self.app.snapshot().get(key)
-        lvl = r.level if (r and r.ok) else None
-        charging = bool(r and r.status == "charging")
+    def _fill_icon(self, nid: NOTIFYICONDATAW):
+        lvl, charging, tip = tray_summary(self.app.snapshot())
         k = (lvl is None, lvl, charging, self.app.theme_light)
         old = self.icons.get(nid.uID)
         if self.icon_keys.get(nid.uID) != k or not old:
@@ -5177,11 +5531,7 @@ class Tray:
                 user32.DestroyIcon(old)
         else:
             nid.hIcon = old
-        name = (r.name if r and r.name else "设备")
-        stamp = time.strftime("%H:%M", time.localtime(r.ts)) if r else "--:--"
-        tip = (f"2.4G · {name}：{r.level}%（{stamp}）" if (r and r.ok)
-               else f"2.4G · {name}：未连接（{stamp}）")
-        nid.szTip = tip[:127]
+        nid.szTip = tip
 
     def refresh_icons(self):
         self.sync_icons()
@@ -5322,6 +5672,10 @@ class TrayApp:
         self._last_poll = 0.0
         self._hotplug_requested = False
         self._toggle_requested = False
+        self._temps: dict = {}
+        self._temps_at = 0.0
+        self._temps_busy = False
+        self._temps_new = False
         self._tray_cmds: "queue.SimpleQueue[int]" = queue.SimpleQueue()
 
     # -- 数据 --------------------------------------------------------------
@@ -5367,6 +5721,23 @@ class TrayApp:
     # -- 交互 --------------------------------------------------------------
     def request_show(self):
         self._show_requested = True
+
+    def _poll_temps(self):
+        """面板打开时每 3 秒在后台线程读一次 CPU / GPU 温度。"""
+        if (self._temps_busy or not self.panel.visible
+                or time.time() - self._temps_at < 3):
+            return
+        self._temps_busy = True
+
+        def work():
+            try:
+                self._temps = read_temperatures()
+            except Exception:
+                self._temps = {"cpu": None, "gpus": [], "ts": time.time()}
+            self._temps_at = time.time()
+            self._temps_new = True
+            self._temps_busy = False
+        threading.Thread(target=work, daemon=True).start()
 
     def request_toggle(self):
         self._toggle_requested = True
@@ -5542,6 +5913,10 @@ class TrayApp:
                     # 刚因点击托盘图标失焦收起的，这次点击就是“关”
                     self.panel.show()
                     self.refresh()
+            self._poll_temps()
+            if self._temps_new:
+                self._temps_new = False
+                self.panel.update_temps()
             while not self._tray_cmds.empty():
                 try:
                     self._run_tray_command(self._tray_cmds.get_nowait())
