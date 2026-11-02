@@ -2,8 +2,8 @@
 # 没有版本信息的 exe 更容易被杀毒软件当成可疑程序。
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2, 5, 2, 0),
-    prodvers=(2, 5, 2, 0),
+    filevers=(2, 6, 0, 0),
+    prodvers=(2, 6, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
       StringTable('080404B0', [
         StringStruct('CompanyName', 'EZ2.4G'),
         StringStruct('FileDescription', '2.4G 外设电量'),
-        StringStruct('FileVersion', '2.5.2'),
+        StringStruct('FileVersion', '2.6.0'),
         StringStruct('InternalName', '2.4G'),
         StringStruct('LegalCopyright', 'Based on EZ2.4G by Ap0LoG1zE'),
         StringStruct('OriginalFilename', '2.4G.exe'),
         StringStruct('ProductName', '2.4G 外设电量'),
-        StringStruct('ProductVersion', '2.5.2')
+        StringStruct('ProductVersion', '2.6.0')
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
