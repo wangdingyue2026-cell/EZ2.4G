@@ -603,11 +603,18 @@ def _devprop(hdev, info, key) -> Optional[tuple]:
 
 def _bt_nodes() -> list:
     """所有带电量属性的蓝牙设备节点：[{inst, level, name, container}]。"""
+    return _bt_scan()[0]
+
+
+def _bt_scan() -> tuple:
+    """一次枚举拿两样：(带电量属性的蓝牙节点, 苹果耳机节点 [{inst, name}])。
+    苹果耳机认 Device ID 里的 VID&0001004C（AirPods、Beats 都是），
+    或者名字里带 AirPods / Beats。"""
     hdev = setupapi.SetupDiGetClassDevsW(None, None, None,
                                          DIGCF_PRESENT | DIGCF_ALLCLASSES)
     if not hdev or hdev == INVALID_HANDLE_VALUE:
-        return []
-    out = []
+        return [], []
+    out, apple = [], []
     try:
         i = 0
         while True:
@@ -622,22 +629,25 @@ def _bt_nodes() -> list:
                 continue
             if not inst.value.upper().startswith(BT_ENUMERATORS):
                 continue
+            name = _devprop(hdev, info, DEVPKEY_NAME)
+            name = (name[1].decode("utf-16-le", "ignore").split("\0")[0]
+                    if name and name[0] == DEVPROP_TYPE_STRING else "")
+            if is_apple_audio(inst.value, name):
+                apple.append({"inst": inst.value, "name": name})
             bat = _devprop(hdev, info, DEVPKEY_BLUETOOTH_BATTERY)
             if not bat or bat[0] != DEVPROP_TYPE_BYTE or not bat[1]:
                 continue
-            name = _devprop(hdev, info, DEVPKEY_NAME)
             cont = _devprop(hdev, info, DEVPKEY_DEVICE_CONTAINER_ID)
             out.append({
                 "inst": inst.value,
                 "level": bat[1][0],
-                "name": (name[1].decode("utf-16-le", "ignore").split("\0")[0]
-                         if name and name[0] == DEVPROP_TYPE_STRING else ""),
+                "name": name,
                 "container": (cont[1].hex()
                               if cont and cont[0] == DEVPROP_TYPE_GUID else ""),
             })
     finally:
         setupapi.SetupDiDestroyDeviceInfoList(hdev)
-    return out
+    return out, apple
 
 
 def _bt_connected() -> dict:
@@ -712,9 +722,15 @@ def read_bluetooth_all() -> dict[str, Reading]:
         return {}
     hidden = set(cfg.get("bt_hidden") or [])
     try:
-        res = _bt_merge(_bt_nodes(), _bt_connected())
+        nodes, apple = _bt_scan()
+        connected = _bt_connected()
+        res = _bt_merge(nodes, connected)
     except Exception:
         return {}
+    try:
+        res.update(read_airpods(apple, connected, res))
+    except Exception:
+        pass
     names = custom_names()
     out = {}
     for key, r in res.items():
@@ -723,6 +739,408 @@ def read_bluetooth_all() -> dict[str, Reading]:
         r.name = names.get(key) or r.name
         out[key] = r
     return out
+
+
+# ===========================================================================
+# AirPods / Beats：Windows 不给苹果耳机电量属性（系统设置里也看不到电量），
+# 但耳机自己一直在发 BLE 广播（苹果厂商数据 0x004C，类型 0x07「接近配对」），
+# 里面带左耳、右耳、充电盒电量和充电状态。这里只被动收听广播，不连接、不写入。
+# 字段布局参考 AirPodsDesktop（SpriteOvO）和 OpenPods 的分析。
+# 防止显示旁边别人的耳机：只给 Windows 里已配对且已连接的苹果耳机找广播，
+# 广播里的型号要和配对设备 Device ID 的 PID 一致，同型号有多副时取信号最强的。
+# ===========================================================================
+APPLE_VID = 0x004C
+APPLE_AUDIO_NAME = re.compile(r"airpods|beats", re.I)
+APPLE_DEVICE_ID = re.compile(r"VID&0001004C_PID&([0-9A-F]{4})")
+AIRPODS_MAX_AGE = 90          # 秒：超过这么久没收到广播就不显示
+AIRPODS_MIN_RSSI = -75        # 不知道型号时，只认离电脑足够近的广播
+
+
+def is_apple_audio(inst: str, name: str) -> bool:
+    return bool(APPLE_DEVICE_ID.search(inst.upper())
+                or APPLE_AUDIO_NAME.search(name or ""))
+
+
+def parse_airpods(data: bytes) -> Optional[dict]:
+    """解析「接近配对」广播（厂商数据去掉 0x004C 之后的部分）。
+    [0]=0x07 [1]=剩余长度 [3:5]=型号(小端) [5]=状态 [6]=两只耳机电量
+    [7]=低 4 位充电盒电量 + 高位充电标志。电量 0~10 对应 0~100%，15 = 不在线。
+    状态 0x20 置位表示这条广播来自左耳，此时 [6] 低 4 位是左耳。"""
+    if len(data) < 9 or data[0] != 0x07 or data[1] < 7:
+        return None
+    model = data[3] | data[4] << 8
+    status, pods, flags = data[5], data[6], data[7]
+    curr, other = pods & 0x0F, pods >> 4
+    curr_chg, other_chg = bool(flags & 0x10), bool(flags & 0x20)
+    if status & 0x20:
+        left, right, lc, rc = curr, other, curr_chg, other_chg
+    else:
+        left, right, lc, rc = other, curr, other_chg, curr_chg
+
+    def pct(v):
+        return v * 10 if v <= 10 else None
+    return {"model": model,
+            "left": pct(left), "right": pct(right), "case": pct(flags & 0x0F),
+            "left_charging": lc, "right_charging": rc,
+            "case_charging": bool(flags & 0x40)}
+
+
+def airpods_reading(p: dict, name: str) -> Optional[Reading]:
+    """卡片电量取两只耳机里低的那只，细节里列出左 / 右 / 充电盒。"""
+    pods = [(p["left"], p["left_charging"]), (p["right"], p["right_charging"])]
+    pods = [(v, c) for v, c in pods if v is not None]
+    if not pods:
+        return None
+    parts = []
+    if p["left"] is not None and p["right"] is not None:
+        parts = [f"左 {p['left']}%", f"右 {p['right']}%"]
+    if p["case"] is not None:
+        parts.append(f"盒 {p['case']}%")
+    charging = all(c for _, c in pods)
+    r = Reading(ok=True, level=min(v for v, _ in pods),
+                status="charging" if charging else "bluetooth",
+                source="蓝牙广播", detail=" · ".join(parts), name=name)
+    r.kind, r.device_type = "bluetooth", "headset"
+    return r
+
+
+def _airpods_merge(apple: list, connected: dict, adverts: dict,
+                   have: dict, now: float) -> dict[str, Reading]:
+    """apple：配对节点 [{inst, name}]；adverts：{BLE 地址: (时间, 信号, 解析结果)}。"""
+    groups: dict[str, dict] = {}
+    for n in apple:
+        addr = _bt_address(n["inst"])
+        if not addr:
+            continue
+        g = groups.setdefault(addr, {"name": "", "pid": None})
+        m = APPLE_DEVICE_ID.search(n["inst"].upper())
+        if m:
+            g["pid"] = int(m.group(1), 16)
+        # 设备节点（BTHENUM\DEV_…）的名字就是用户看到的名字；没有就取最短的服务节点名
+        if not n["name"]:
+            continue
+        if n["inst"].upper().startswith("BTHENUM\\DEV_"):
+            g["dev_name"] = n["name"]
+        elif not g["name"] or len(n["name"]) < len(g["name"]):
+            g["name"] = n["name"]
+    out: dict[str, Reading] = {}
+    for addr, g in groups.items():
+        key = "bt_" + addr.lower()
+        if key in have or connected.get(addr) is False:
+            continue
+        best = None
+        for ts, rssi, p in adverts.values():
+            if now - ts > AIRPODS_MAX_AGE:
+                continue
+            if g["pid"] is not None and p["model"] != g["pid"]:
+                continue
+            if g["pid"] is None and rssi < AIRPODS_MIN_RSSI:
+                continue
+            if best is None or rssi > best[0]:
+                best = (rssi, p)
+        if best is None:
+            continue
+        r = airpods_reading(best[1],
+                            g.get("dev_name") or g["name"] or "AirPods")
+        if r is not None:
+            out[key] = r
+    return out
+
+
+# --- WinRT 小工具：用 ctypes 直接调 COM 虚表，不依赖第三方库 ----------------
+_HR = ctypes.c_long
+E_NOINTERFACE = -2147467262
+IID_IUNKNOWN = "{00000000-0000-0000-C000-000000000046}"
+IID_IAGILE = "{94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}"
+IID_BLE_WATCHER = "{A6AC336F-F3D3-4297-8D6C-C81EA6623F40}"
+IID_BLE_ADV = "{066FB2B7-33D1-4E7D-8367-CF81D0F79653}"
+IID_BLE_MFR = "{912DBA18-6963-4533-B061-4694DAFB34E5}"
+IID_BUFFER_BYTES = "{905A0FEF-BC53-11DF-8C49-001E4FC686DA}"
+# TypedEventHandler<BluetoothLEAdvertisementWatcher, ReceivedEventArgs>，
+# 按 WinRT 参数化接口规则（UUID v5）算出来的
+IID_BLE_RECEIVED = "{90EB4ECA-D465-5EA0-A61C-033C8C5ECEF2}"
+BLE_WATCHER_CLASS = "Windows.Devices.Bluetooth.Advertisement." \
+                    "BluetoothLEAdvertisementWatcher"
+_combase = None
+
+
+def _winrt():
+    global _combase
+    if _combase is None:
+        _combase = False
+        try:
+            dll = ctypes.WinDLL("combase")
+            dll.RoInitialize.argtypes = [ctypes.c_int]
+            dll.WindowsCreateString.argtypes = [
+                wt.LPCWSTR, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+            dll.WindowsDeleteString.argtypes = [ctypes.c_void_p]
+            dll.RoActivateInstance.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+            dll.RoGetActivationFactory.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(GUID),
+                ctypes.POINTER(ctypes.c_void_p)]
+            _combase = dll
+        except Exception:
+            pass
+    return _combase or None
+
+
+def _vt(obj, idx: int, *argtypes):
+    """obj 虚表里第 idx 个方法（IInspectable 自己占 0~5，接口方法从 6 开始）。"""
+    vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+    fn = ctypes.WINFUNCTYPE(_HR, ctypes.c_void_p, *argtypes)(vtbl[idx])
+    return lambda *a: fn(obj, *a)
+
+
+def _release(obj):
+    if obj:
+        _vt(obj, 2)()
+
+
+def _qi(obj, iid: str):
+    out = ctypes.c_void_p()
+    g = GUID(iid)
+    hr = _vt(obj, 0, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p))(
+        ctypes.byref(g), ctypes.byref(out))
+    return out.value if hr >= 0 and out.value else None
+
+
+def _hstring(dll, s: str):
+    h = ctypes.c_void_p()
+    if dll.WindowsCreateString(s, len(s), ctypes.byref(h)) < 0:
+        return None
+    return h
+
+
+def _activate(cls: str, iid: str):
+    """RoActivateInstance + QueryInterface，失败返回 None。"""
+    dll = _winrt()
+    if dll is None:
+        return None
+    h = _hstring(dll, cls)
+    if h is None:
+        return None
+    try:
+        insp = ctypes.c_void_p()
+        if dll.RoActivateInstance(h, ctypes.byref(insp)) < 0 or not insp.value:
+            return None
+    finally:
+        dll.WindowsDeleteString(h)
+    try:
+        return _qi(insp.value, iid)
+    finally:
+        _release(insp.value)
+
+
+def _factory(cls: str, iid: str):
+    dll = _winrt()
+    if dll is None:
+        return None
+    h = _hstring(dll, cls)
+    if h is None:
+        return None
+    try:
+        out = ctypes.c_void_p()
+        g = GUID(iid)
+        if dll.RoGetActivationFactory(h, ctypes.byref(g),
+                                      ctypes.byref(out)) < 0:
+            return None
+        return out.value
+    finally:
+        dll.WindowsDeleteString(h)
+
+
+def _buffer_bytes(buf) -> bytes:
+    """IBuffer → bytes（经 IBufferByteAccess 拿内存地址）。"""
+    n = ctypes.c_uint32()
+    if _vt(buf, 7, ctypes.POINTER(ctypes.c_uint32))(ctypes.byref(n)) < 0:
+        return b""
+    acc = _qi(buf, IID_BUFFER_BYTES)
+    if not acc:
+        return b""
+    try:
+        p = ctypes.c_void_p()
+        if _vt(acc, 3, ctypes.POINTER(ctypes.c_void_p))(ctypes.byref(p)) < 0:
+            return b""
+        return ctypes.string_at(p.value, n.value) if p.value else b""
+    finally:
+        _release(acc)
+
+
+def ble_apple_data(adv) -> list:
+    """IBluetoothLEAdvertisement 里所有苹果厂商数据（每段是 bytes）。"""
+    view = ctypes.c_void_p()
+    hr = _vt(adv, 13, ctypes.c_uint16, ctypes.POINTER(ctypes.c_void_p))(
+        APPLE_VID, ctypes.byref(view))
+    if hr < 0 or not view.value:
+        return []
+    out = []
+    try:
+        n = ctypes.c_uint32()
+        _vt(view.value, 7, ctypes.POINTER(ctypes.c_uint32))(ctypes.byref(n))
+        for i in range(min(n.value, 4)):
+            item = ctypes.c_void_p()
+            if _vt(view.value, 6, ctypes.c_uint32,
+                   ctypes.POINTER(ctypes.c_void_p))(
+                    i, ctypes.byref(item)) < 0 or not item.value:
+                continue
+            try:
+                buf = ctypes.c_void_p()
+                if _vt(item.value, 8, ctypes.POINTER(ctypes.c_void_p))(
+                        ctypes.byref(buf)) >= 0 and buf.value:
+                    try:
+                        out.append(_buffer_bytes(buf.value))
+                    finally:
+                        _release(buf.value)
+            finally:
+                _release(item.value)
+    finally:
+        _release(view.value)
+    return out
+
+
+_QI_T = ctypes.WINFUNCTYPE(_HR, ctypes.c_void_p, ctypes.POINTER(GUID),
+                           ctypes.POINTER(ctypes.c_void_p))
+_REF_T = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+_INVOKE_T = ctypes.WINFUNCTYPE(_HR, ctypes.c_void_p, ctypes.c_void_p,
+                               ctypes.c_void_p)
+
+
+class _DelegateVtbl(ctypes.Structure):
+    _fields_ = [("qi", _QI_T), ("addref", _REF_T), ("release", _REF_T),
+                ("invoke", _INVOKE_T)]
+
+
+class _DelegateObj(ctypes.Structure):
+    _fields_ = [("vtbl", ctypes.POINTER(_DelegateVtbl))]
+
+
+class _Delegate:
+    """手搓的 WinRT 事件回调对象。对象一直留在内存里，引用计数固定返回 1。"""
+
+    def __init__(self, iid: str, fn):
+        self._ok = {bytes(GUID(x)) for x in (IID_IUNKNOWN, IID_IAGILE, iid)}
+        self._fn = fn
+        self._vtbl = _DelegateVtbl(_QI_T(self._qi), _REF_T(self._ref),
+                                   _REF_T(self._ref), _INVOKE_T(self._invoke))
+        self._obj = _DelegateObj(ctypes.pointer(self._vtbl))
+        self.ptr = ctypes.addressof(self._obj)
+
+    def _qi(self, this, riid, out):
+        if bytes(riid.contents) in self._ok:
+            out[0] = this
+            return 0
+        out[0] = None
+        return E_NOINTERFACE
+
+    def _ref(self, this):
+        return 1
+
+    def _invoke(self, this, sender, args):
+        try:
+            self._fn(args)
+        except Exception:
+            pass
+        return 0
+
+
+class AirPodsListener:
+    """后台被动收听 BLE 广播，只留苹果「接近配对」那一种。
+    有苹果耳机连着才开始听；5 分钟没人要数据就停掉，省电。"""
+    IDLE_STOP = 300
+
+    def __init__(self):
+        self.adverts: dict = {}
+        self.lock = threading.Lock()
+        self.wanted = 0.0
+        self.started = False
+        self.error = ""
+
+    def want(self) -> bool:
+        """标记“现在需要数据”；返回 True 表示这次才刚开始听。"""
+        self.wanted = time.time()
+        if self.started:
+            return False
+        self.started = True
+        threading.Thread(target=self._run, daemon=True).start()
+        return True
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return dict(self.adverts)
+
+    def _on_received(self, args):
+        adv = ctypes.c_void_p()
+        if _vt(args, 10, ctypes.POINTER(ctypes.c_void_p))(
+                ctypes.byref(adv)) < 0 or not adv.value:
+            return
+        try:
+            datas = ble_apple_data(adv.value)
+        finally:
+            _release(adv.value)
+        hits = [p for p in map(parse_airpods, datas) if p]
+        if not hits:
+            return
+        rssi = ctypes.c_int16()
+        addr = ctypes.c_uint64()
+        _vt(args, 6, ctypes.POINTER(ctypes.c_int16))(ctypes.byref(rssi))
+        _vt(args, 7, ctypes.POINTER(ctypes.c_uint64))(ctypes.byref(addr))
+        now = time.time()
+        with self.lock:
+            self.adverts[addr.value] = (now, rssi.value, hits[0])
+            if len(self.adverts) > 32:
+                for k, v in list(self.adverts.items()):
+                    if now - v[0] > AIRPODS_MAX_AGE:
+                        del self.adverts[k]
+
+    def _run(self):
+        dll = _winrt()
+        if dll is None:
+            self.error = "没有 WinRT"
+            return
+        dll.RoInitialize(1)       # 多线程套间：回调直接在系统线程池里来
+        w = _activate(BLE_WATCHER_CLASS, IID_BLE_WATCHER)
+        if not w:
+            self.error = "无法创建蓝牙广播监听"
+            return
+        self._delegate = _Delegate(IID_BLE_RECEIVED, self._on_received)
+        token = ctypes.c_int64()
+        if _vt(w, 19, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int64))(
+                self._delegate.ptr, ctypes.byref(token)) < 0:
+            self.error = "无法订阅蓝牙广播"
+            return
+        scanning = False
+        while True:
+            idle = time.time() - self.wanted > self.IDLE_STOP
+            st = ctypes.c_int(-1)
+            _vt(w, 10, ctypes.POINTER(ctypes.c_int))(ctypes.byref(st))
+            if idle and scanning:
+                _vt(w, 18)()                  # Stop
+                scanning = False
+            elif not idle and st.value in (0, 3, 4):
+                # 0 = 刚创建、3 = 已停止、4 = 中断（比如蓝牙被关掉），重新开始
+                scanning = _vt(w, 17)() >= 0  # Start
+            time.sleep(5)
+
+
+AIRPODS = AirPodsListener()
+
+
+def read_airpods(apple: list, connected: dict, have: dict) -> dict:
+    """已连接的苹果耳机 → 从广播里找电量。第一次开始听时等几秒，
+    耳机通常每秒都会广播，等到了就不用多等一轮刷新。"""
+    if not apple:
+        return {}
+    addrs = {_bt_address(n["inst"]) for n in apple}
+    if not any(connected.get(a) is not False for a in addrs if a):
+        return {}
+    if AIRPODS.want():
+        for _ in range(8):
+            time.sleep(0.5)
+            if AIRPODS.snapshot():
+                break
+    return _airpods_merge(apple, connected, AIRPODS.snapshot(), have,
+                          time.time())
 
 
 # ===========================================================================
@@ -4129,7 +4547,8 @@ def device_kind(name: str, fallback: str = "device",
         return known
     n = (name or "").lower()
     for words, key in ((("mouse", "鼠标", "mice"), "mouse"),
-                       (("headset", "耳机", "buds", "headphone", "audio"),
+                       (("headset", "耳机", "buds", "headphone", "audio",
+                         "airpods", "beats"),
                         "headset"),
                        (("keyboard", "键盘"), "keyboard"),
                        (("gamepad", "controller", "手柄"), "gamepad")):
@@ -7949,6 +8368,7 @@ TPM_RIGHTBUTTON = 0x0002
 TPM_RETURNCMD = 0x0100
 TRAY_OPEN, TRAY_REFRESH, TRAY_STARTUP, TRAY_QUIT, TRAY_BT = 1, 2, 3, 4, 5
 TRAY_IMPORT = 6
+TRAY_LOW = 7
 
 
 def allow_dark_menus() -> None:
@@ -7983,6 +8403,41 @@ def tray_summary(snap: dict) -> tuple:
     return low.level, low.status == "charging", tip[:127]
 
 
+LOW_ALERT_AT = 20       # 和面板上“电量低”的标准一致
+LOW_ALERT_AGAIN = 10
+LOW_ALERT_RESET = 30
+
+
+def low_alerts(res: dict, state: dict) -> list:
+    """返回这一轮需要提醒的设备（电量从低到高）；state 记着每台已经提醒到第几档。"""
+    out = []
+    for key, r in res.items():
+        if not r or not r.ok or r.level is None or r.stale or not r.present:
+            continue
+        if r.status in ("charging", "full", "wired") or \
+                r.level >= LOW_ALERT_RESET:
+            state.pop(key, None)
+            continue
+        stage = (2 if r.level <= LOW_ALERT_AGAIN
+                 else 1 if r.level < LOW_ALERT_AT else 0)
+        if stage > state.get(key, 0):
+            state[key] = stage
+            out.append(r)
+    return sorted(out, key=lambda r: r.level)
+
+
+def low_alert_text(rs: list) -> tuple:
+    """(正文, 标题)"""
+    if len(rs) == 1:
+        r = rs[0]
+        name = r.name or "设备"
+        if r.level <= LOW_ALERT_AGAIN:
+            return f"{name} 只剩 {r.level}% 电量，尽快充电吧", "电量很低"
+        return f"{name} 还剩 {r.level}% 电量，记得充电", "电量低"
+    names = "、".join(f"{r.name or '设备'} {r.level}%" for r in rs)
+    return f"这些设备该充电了：{names}", "电量低"
+
+
 class Tray:
     CLASS_NAME = "BatteryTrayWndDSH"
 
@@ -7996,7 +8451,7 @@ class Tray:
         self.enabled = True
         self.taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
         self._wndproc = WNDPROC(self._proc)
-        self._big_icon = 0
+        self._big_icons: dict[int, int] = {}
 
     def start(self):
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -8070,23 +8525,27 @@ class Tray:
     def refresh_icons(self):
         self.sync_icons()
 
-    def notify(self, text: str, title: str = "2.4G") -> bool:
-        """托盘气泡通知（Windows 通知中心也会收到），配 64px 满电圆环图标。"""
+    def notify(self, text: str, title: str = "2.4G",
+               level: int = 100) -> bool:
+        """托盘气泡通知（Windows 通知中心也会收到），配 64px 电量圆环图标。"""
         nid = self.nids.get(1)
         if nid is None:
             return False
-        if not self._big_icon:
-            self._big_icon = make_battery_icon(100, self.app.theme_light,
-                                               False, size=64)
+        icon = self._big_icons.get(level)
+        if not icon:
+            icon = make_battery_icon(level, self.app.theme_light, False,
+                                     size=64)
+            if icon:
+                self._big_icons[level] = icon
         old_icon = nid.hIcon
-        if self._big_icon:
-            nid.hIcon = self._big_icon
+        if icon:
+            nid.hIcon = icon
         nid.uFlags = NIF_INFO | NIF_ICON
         nid.uVersion = 10000          # 10 秒
         nid.szInfo = text[:255]
         nid.szInfoTitle = title[:63]
         nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON
-        nid.hBalloonIcon = self._big_icon
+        nid.hBalloonIcon = icon or 0
         ok = shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         nid.hIcon = old_icon
@@ -8100,9 +8559,9 @@ class Tray:
         for h in list(self.icons.values()):
             user32.DestroyIcon(h)
         self.icons.clear()
-        if self._big_icon:
-            user32.DestroyIcon(self._big_icon)
-            self._big_icon = 0
+        for h in self._big_icons.values():
+            user32.DestroyIcon(h)
+        self._big_icons.clear()
 
     def _context_menu(self, hwnd):
         menu = user32.CreatePopupMenu()
@@ -8127,6 +8586,9 @@ class Tray:
             user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if
                                load_config().get("bluetooth", True) else 0),
                                TRAY_BT, "显示蓝牙设备电量")
+            user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if
+                               load_config().get("low_alert", True) else 0),
+                               TRAY_LOW, "低电量提醒")
             user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if
                                startup_enabled() else 0),
                                TRAY_STARTUP, "开机自启")
@@ -8210,6 +8672,7 @@ class TrayApp:
         self._dirty = False
         self._show_requested = False
         self._full: dict[str, bool] = {}
+        self._low: dict[str, int] = {}
         self.devices = load_saved_devices()
         self._seen = None
         self._asked = set()
@@ -8243,6 +8706,7 @@ class TrayApp:
         with self._lock:
             self._readings = res
         self._check_full(res)
+        self._check_low(res)
         self._refreshing = False
         self._dirty = True
         if self.tray and self.tray.hwnd:
@@ -8263,6 +8727,19 @@ class TrayApp:
                             pass
             elif r.level < 97:
                 self._full[key] = False
+
+    def _check_low(self, res):
+        """电量掉到 20% 以下弹一次气泡，到 10% 以下再提醒一次；
+        充上电或回到 30% 以上重新布防。同一轮有几台一起低就合成一条。"""
+        if not load_config().get("low_alert", True):
+            return
+        new = low_alerts(res, self._low)
+        if not new or not self.tray:
+            return
+        try:
+            self.tray.notify(*low_alert_text(new), level=new[0].level)
+        except Exception:
+            pass
 
     # -- 交互 --------------------------------------------------------------
     def request_show(self):
@@ -8310,6 +8787,11 @@ class TrayApp:
                 cfg["bt_hidden"] = []  # 重新打开时把单独隐藏的也恢复
             save_config(cfg)
             self.refresh()
+        elif cmd == TRAY_LOW:
+            cfg = load_config()
+            cfg["low_alert"] = not cfg.get("low_alert", True)
+            save_config(cfg)
+            self._low.clear()
         elif cmd == TRAY_QUIT:
             self.quit()
 

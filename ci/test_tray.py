@@ -82,4 +82,44 @@ def tooltip_fits_windows_limit():
     assert len(tip) <= 127 and tip.startswith("2.4G · 最低 50%"), len(tip)
 
 
+@case
+def low_battery_alert_once_per_stage():
+    """20% 以下提醒一次，10% 以下再提醒一次；充电或回到 30% 以上才重新布防。"""
+    st = {}
+    snap = {"m": R(ok=True, level=50, name="鼠标")}
+    assert md.low_alerts(snap, st) == []
+    snap["m"].level = 18
+    assert [r.name for r in md.low_alerts(snap, st)] == ["鼠标"]
+    assert md.low_alerts(snap, st) == []            # 同一档不重复
+    snap["m"].level = 22                            # 20~30 之间不重新布防
+    assert md.low_alerts(snap, st) == []
+    snap["m"].level = 15
+    assert md.low_alerts(snap, st) == []
+    snap["m"].level = 9
+    assert len(md.low_alerts(snap, st)) == 1        # 第二档
+    snap["m"].status = "charging"
+    assert md.low_alerts(snap, st) == [] and st == {}
+    snap["m"].status = "discharging"
+    assert len(md.low_alerts(snap, st)) == 1        # 充过电又低了，再提醒
+
+
+@case
+def low_battery_alert_skips_unreliable_and_merges():
+    st = {}
+    snap = {"a": R(ok=True, level=12, name="键盘", stale=True),
+            "b": R(ok=False, name="没读到"),
+            "c": R(ok=True, level=5, name="鼠标", present=False),
+            "d": R(ok=True, level=8, name="手柄"),
+            "e": R(ok=True, level=16, name="耳机", kind="bluetooth")}
+    rs = md.low_alerts(snap, st)
+    assert [r.name for r in rs] == ["手柄", "耳机"], rs
+    text, title = md.low_alert_text(rs)
+    assert title == "电量低" and text == "这些设备该充电了：手柄 8%、耳机 16%", text
+    text, title = md.low_alert_text(rs[:1])
+    assert title == "电量很低" and "手柄" in text and "8%" in text, text
+    text, title = md.low_alert_text(rs[1:])
+    assert title == "电量低" and "耳机" in text and "16%" in text, text
+    assert len(text) < 256
+
+
 print(f"\n{len(passed)} tray tests passed")

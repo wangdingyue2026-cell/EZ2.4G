@@ -40,6 +40,8 @@ python my_devices.py
 
 - Windows 11 Fluent 风格界面：跟随系统深浅色和强调色，Win11 原生圆角与阴影
 - 同时显示**蓝牙设备**电量（耳机、鼠标、手写笔等，和 Windows 设置里看到的一致）：已连接的自动出现，右键可改名或“不再显示”，托盘右键菜单可整体关闭
+- **AirPods / Beats** 也能显示：Windows 自己看不到苹果耳机的电量，这里从耳机的蓝牙广播里读，卡片上分别列出左耳、右耳、充电盒
+- **低电量提醒**：设备电量低于 20% 时托盘弹出气泡提示，低于 10% 再提醒一次；充上电后重新计数。托盘右键菜单「低电量提醒」可关闭
 - 托盘只放**一个图标**，显示所有设备里**最低的电量**；鼠标悬停列出每台设备的电量。**左键**弹出电量面板（贴着任务栏浮出，点别处自动收起），**右键**菜单列出每台设备的电量，还可刷新、导入协议、开关开机自启、退出
 - 面板顶部显示 **CPU / GPU 温度**，打开面板时每 3 秒刷新，圆点颜色随温度变化（<70°C 绿、<85°C 黄、更高红），详见下方[温度说明](#cpu--gpu-温度)
 - 面板里每台设备一张卡片：设备图标、状态、电量圆环；右键卡片可重命名、设置读取、导入 / 导出协议、复制设备信息、删除
@@ -78,8 +80,11 @@ python my_devices.py
 | LAMZU / Pulsar / WLmouse | 用 PixArt 方案的无线鼠标 | Feature 查询 | FerrisPulse 文档，**未经真机验证** |
 | Xbox 兼容手柄 | Xbox、8BitDo 等 XInput 手柄 | XInput（只有四档：满 / 中 / 低 / 空） | Voltide |
 | 蓝牙设备 | 耳机、鼠标、手写笔等 | Windows 自带电量 | — |
+| 苹果 AirPods / Beats | AirPods、AirPods Pro（含 Pro 3）、Beats 系列 | 被动收听蓝牙广播（只听不发） | AirPodsDesktop · OpenPods 的格式分析 |
 
 另外，任何上报**标准 HID 电量**的设备也能直接读。
+
+**AirPods 说明**：耳机要先在 Windows 里配对，并且正连着这台电脑（连着手机时不显示）。连上后几秒内出现，电量 10% 一档（苹果广播本身的精度）。为了不显示旁边别人的耳机，只认和你配对的耳机同型号、信号最强的那一副。耳机放回盒里合上盖子后会断开，卡片随之消失。
 
 ### 安全原则
 
@@ -243,7 +248,8 @@ python my_devices.py --export 文件.json  :: 导出协议
 本仓库在此基础上做的改动：
 
 - Windows 11 Fluent 风格的界面与动效，托盘左键弹出面板、右键菜单；
-- 显示蓝牙设备电量；
+- 显示蓝牙设备电量，以及从蓝牙广播读取 AirPods / Beats 电量（广播格式参考 [AirPodsDesktop](https://github.com/SpriteOvO/AirPodsDesktop) 与 [OpenPods](https://github.com/adolfintel/OpenPods) 的分析，均为 GPL-3.0，只参考了格式，未复制代码）；
+- 低电量托盘气泡提醒；
 - 内置设备适配器、协议导入 / 导出和设备规格导入。方法与协议参考了这些项目，在此一并致谢：
   [Voltide](https://github.com/sdparklab/Voltide)（MIT，适配器架构与罗技 / 迈从 / ROG / 雷蛇 / ATK / IMECOO / XInput 协议）、
   [InphicBatteryTray](https://github.com/Tan-TanZi/InphicBatteryTray)（MIT，英菲克 IN10 / IN9）、
